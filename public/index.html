@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AI 视频无限画布 MVP</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-main">
+        <button id="toggleLeftPanel" class="ghost-button">隐藏左栏</button>
+        <div class="project-summary">
+          <div class="topbar-kicker">当前项目</div>
+          <input id="projectName" value="AI视频项目" aria-label="当前项目名称" readonly>
+          <span id="projectLabel">还没打开项目</span>
+        </div>
+      </div>
+      <div class="topbar-side">
+        <div class="topbar-buttons">
+          <button id="createProject">打开/创建项目</button>
+          <button id="saveCanvas" class="primary">保存画布</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <aside class="panel left">
+        <section class="left-section" data-section-id="shot-table">
+          <button class="section-toggle" data-toggle-section="shot-table" aria-expanded="true">
+            <h2>分镜表</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <div class="shot-primary-actions">
+              <button id="openShotsImport">导入分镜</button>
+              <button id="openProjectTags">标签绑定</button>
+              <button id="openAssetsPanel">素材资产</button>
+            </div>
+            <div id="workflowList" class="workflow-list"></div>
+            <div id="shotTable" class="shot-table"></div>
+          </div>
+        </section>
+
+        <section class="left-section collapsed" data-section-id="project-tags">
+          <button class="section-toggle" data-toggle-section="project-tags" aria-expanded="false">
+            <h2>项目标签</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <div id="tagList" class="tag-list"></div>
+          </div>
+        </section>
+
+        <section class="left-section collapsed" data-section-id="node-tools">
+          <button class="section-toggle" data-toggle-section="node-tools" aria-expanded="false">
+            <h2>添加节点</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <div class="grid-actions">
+              <button data-add="text">文本</button>
+              <button data-add="memo">备忘录</button>
+              <button data-add="imageGen">图片生成</button>
+              <button data-add="videoGen">视频生成</button>
+            </div>
+            <p class="hint">也可以在画布空白处右键添加到鼠标位置。</p>
+            <label class="file-button">
+              导入本地素材
+              <input id="assetFile" type="file" hidden>
+            </label>
+            <div class="remote-asset-import">
+              <input id="remoteAssetUrl" type="text" placeholder="粘贴角色库图片 URL">
+              <input id="remoteAssetName" type="text" placeholder="素材名称（可选）">
+              <button id="importRemoteAsset">导入 URL 素材</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="left-section collapsed" data-section-id="shot-import">
+          <button class="section-toggle" data-toggle-section="shot-import" aria-expanded="false">
+            <h2>分镜导入</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <p class="hint">上传 Excel，支持 5 列：分镜号 | 衔接方式 | 图片提示词 | 视频提示词 | 模型推荐（可选）。衔接方式支持：新建首帧、接上一尾帧、视频直出。</p>
+            <label class="field compact">
+              <span>Seedance 默认平台</span>
+              <select id="seedancePlatformPreference">
+                <option value="lovart">Lovart</option>
+                <option value="jimeng_cli">即梦 CLI</option>
+              </select>
+            </label>
+            <label class="file-button">
+              选择分镜 Excel
+              <input id="shotsFile" type="file" accept=".xlsx" hidden>
+            </label>
+            <div id="shotsImportStatus" class="hint"></div>
+          </div>
+        </section>
+
+        <section class="left-section collapsed" data-section-id="asset-library">
+          <button class="section-toggle" data-toggle-section="asset-library" aria-expanded="false">
+            <h2>资产素材库</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <p class="hint">导入固定格式 Markdown，提取全局规则和 @资产模板，按分类生成资产图。</p>
+            <label class="file-button">
+              选择资产 Markdown
+              <input id="assetLibraryFile" type="file" accept=".md,.markdown,.txt" hidden>
+            </label>
+            <div class="field compact">
+              <span>统一图片模型</span>
+              <select id="assetLibraryModel"></select>
+            </div>
+            <button id="createAssetNodes">一键创建资产节点</button>
+            <div id="assetLibraryStatus" class="hint"></div>
+            <div id="assetLibraryList" class="asset-library-list"></div>
+          </div>
+        </section>
+
+        <section class="left-section collapsed" data-section-id="lovart-config">
+          <button class="section-toggle" data-toggle-section="lovart-config" aria-expanded="false">
+            <h2>Lovart 配置</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <p class="hint">密钥和 skill 路径都保存在本地设置里。换电脑后，填好这三项就能继续用。</p>
+            <input id="lovartAccessKey" type="password" placeholder="粘贴 Access Key">
+            <input id="lovartSecretKey" type="password" placeholder="粘贴 Secret Key">
+            <input id="lovartSkillPath" type="text" placeholder="粘贴 lovart-skill 的 agent_skill.py 路径">
+            <button id="saveLovartKey">保存 Lovart 配置</button>
+            <div id="lovartKeyStatus" class="hint"></div>
+          </div>
+        </section>
+
+        <section class="left-section asset-section collapsed" id="assetSection" data-section-id="assets">
+          <button class="section-toggle" id="assetSectionTitle" data-toggle-section="assets" aria-expanded="false">
+            <h2>素材资产</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <p class="hint asset-section-hint">默认收起，避免干扰。需要时展开管理素材。</p>
+            <div id="assetList" class="asset-list"></div>
+          </div>
+        </section>
+      </aside>
+
+      <div id="leftResizeHandle" class="panel-resize-handle left" aria-hidden="true"></div>
+
+      <section class="canvas-wrap">
+        <div class="canvas-toolbar">
+          <button id="toggleMarqueeMode">框选多选</button>
+          <button id="connectMode">开始连线</button>
+          <button id="deleteEdge">删除连线</button>
+          <button id="alignLeft">左对齐</button>
+          <button id="alignTop">上对齐</button>
+          <button id="distributeHorizontal">横向分布</button>
+          <button id="distributeVertical">纵向分布</button>
+          <button id="clearSelection">取消选择</button>
+          <button id="zoomOut">缩小</button>
+          <button id="zoomIn">放大</button>
+          <button id="fitCanvas">适配全部</button>
+          <button id="resetView">重置视图</button>
+          <span id="status">准备就绪</span>
+        </div>
+        <div id="canvas" class="canvas"></div>
+        <div id="contextMenu" class="context-menu" hidden>
+          <button data-context-add="text">添加文本</button>
+          <button data-context-add="memo">添加备忘录</button>
+          <button data-context-add="imageGen">添加图片生成</button>
+          <button data-context-add="videoGen">添加视频生成</button>
+        </div>
+      </section>
+
+      <aside class="panel right">
+        <div class="right-tabs">
+          <button class="right-tab active" data-right-tab="inspector">当前节点</button>
+          <button class="right-tab" data-right-tab="params">Lovart 参数</button>
+          <button class="right-tab" data-right-tab="jobs">任务记录</button>
+          <button class="right-tab" data-right-tab="review">项目复盘</button>
+        </div>
+
+        <section data-right-panel="inspector">
+          <h2>当前节点</h2>
+          <div id="inspector" class="inspector empty">选择一个节点查看设置。</div>
+        </section>
+
+        <section data-right-panel="params" hidden>
+          <h2>Lovart 参数</h2>
+          <div id="lovartParams" class="params"></div>
+        </section>
+
+        <section data-right-panel="jobs" hidden>
+          <h2>任务记录</h2>
+          <div id="jobList" class="job-list"></div>
+        </section>
+
+        <section data-right-panel="review" hidden>
+          <h2>项目复盘</h2>
+          <div id="reviewList" class="review-list"></div>
+        </section>
+      </aside>
+    </main>
+
+    <div id="videoPreviewModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-preview></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <strong id="videoPreviewTitle">视频预览</strong>
+          <button data-close-preview>关闭</button>
+        </div>
+        <video id="videoPreviewPlayer" controls></video>
+        <div class="modal-actions">
+          <button id="capturePreviewFrame">提取当前帧</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="shotConflictModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-shot-conflict></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <strong>分镜冲突处理</strong>
+          <button data-close-shot-conflict>关闭</button>
+        </div>
+        <div id="shotConflictBody" class="modal-body"></div>
+        <div class="modal-actions">
+          <button id="shotConflictSkip">跳过这条</button>
+          <button id="shotConflictApply" class="primary">覆盖这条</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="seedanceImportModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-seedance-import></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <strong>Seedance 默认平台</strong>
+          <button data-close-seedance-import>关闭</button>
+        </div>
+        <div class="modal-body">
+          <p class="hint">这次导入里检测到了 Seedance 系列模型，或“视频直出”分镜。请先定这批分镜默认走哪边。</p>
+          <div id="seedanceImportSummary" class="hint"></div>
+        </div>
+        <div class="modal-actions">
+          <button id="seedanceImportLovart">走 Lovart</button>
+          <button id="seedanceImportJimeng" class="primary">走 即梦 CLI</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="tagPickerModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-tag-picker></div>
+      <div class="modal-panel wide">
+        <div class="modal-header">
+          <strong id="tagPickerTitle">选择标签资产</strong>
+          <button data-close-tag-picker>关闭</button>
+        </div>
+        <div class="tag-picker-layout">
+          <div id="tagPickerList" class="tag-picker-list"></div>
+          <div id="tagPickerPreview" class="tag-picker-preview">把鼠标停在资产上预览。</div>
+        </div>
+        <div class="modal-actions">
+          <button id="tagPickerSave" class="primary">保存绑定</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="projectPickerModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-project-picker></div>
+      <div class="modal-panel">
+        <div class="modal-header">
+          <strong>打开或创建项目</strong>
+          <button data-close-project-picker>关闭</button>
+        </div>
+        <div class="modal-body">
+          <label class="field">
+            <span>项目保存目录</span>
+            <div class="project-root-controls">
+              <input id="projectRootInput" placeholder="项目保存目录">
+              <button id="saveProjectRoot">保存目录</button>
+            </div>
+          </label>
+          <div class="project-picker-layout">
+            <div>
+              <div class="hint">已有项目</div>
+              <div id="projectPickerList" class="project-picker-list"></div>
+            </div>
+            <div>
+              <div class="hint">新建项目</div>
+              <label class="field">
+                <span>项目名称</span>
+                <input id="projectCreateName" placeholder="输入新项目名称">
+              </label>
+              <button id="projectCreateConfirm" class="primary">创建并打开</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
