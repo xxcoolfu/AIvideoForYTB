@@ -66,10 +66,18 @@ const JIMENG_VIDEO_MODES = [
   { value: "image2video", label: "单图生视频" },
   { value: "multimodal2video", label: "全能参考视频" },
 ];
+const JIMENG_IMAGE_MODES = [
+  { value: "text2image", label: "文生图" },
+  { value: "image2image", label: "图生图" },
+];
 const JIMENG_VIDEO_MODELS = {
   text2video: ["seedance2.0fast", "seedance2.0", "seedance2.0fast_vip", "seedance2.0_vip"],
   image2video: ["3.0fast", "3.0", "3.0pro", "3.5pro", "seedance2.0fast", "seedance2.0", "seedance2.0fast_vip", "seedance2.0_vip"],
   multimodal2video: ["seedance2.0fast", "seedance2.0", "seedance2.0fast_vip", "seedance2.0_vip"],
+};
+const JIMENG_IMAGE_MODELS = {
+  text2image: ["5.0", "4.6", "4.5", "4.1", "4.0", "3.1", "3.0"],
+  image2image: ["5.0", "4.6", "4.5", "4.1", "4.0"],
 };
 const SHOT_SEEDANCE_PLATFORM_KEY = "ai-video-seedance-platform";
 const LEFT_PANEL_WIDTH_KEY = "ai-video-left-panel-width";
@@ -430,10 +438,11 @@ function formatGeneratorParameters(parameters = {}) {
   const isJimeng = parameters.platform === "jimeng_cli";
   return [
     parameters.model || "",
-    parameters.mode ? `模式 ${jimengVideoModeLabel(parameters.mode)}` : "",
+    parameters.mode ? `模式 ${jimengModeLabel(parameters.mode)}` : "",
     parameters.size ? `画幅 ${parameters.size}` : "",
     parameters.duration ? `时长 ${parameters.duration}` : "",
     parameters.video_resolution ? `分辨率 ${parameters.video_resolution}` : "",
+    parameters.resolution_type ? `分辨率 ${parameters.resolution_type}` : "",
     !isJimeng && parameters.feature ? `功能 ${parameters.feature}` : "",
   ].filter(Boolean).join(" · ");
 }
@@ -449,8 +458,9 @@ function commonParameterSummary(parameters = {}) {
 function platformParameterSummary(platform, parameters = {}) {
   if (platform === "jimeng_cli") {
     return [
-      parameters.mode ? `模式 ${jimengVideoModeLabel(parameters.mode)}` : "",
+      parameters.mode ? `模式 ${jimengModeLabel(parameters.mode)}` : "",
       parameters.video_resolution ? `分辨率 ${parameters.video_resolution}` : "",
+      parameters.resolution_type ? `分辨率 ${parameters.resolution_type}` : "",
     ].filter(Boolean).join(" · ");
   }
   return [
@@ -476,7 +486,7 @@ function visibleSubmittedCommand(job = {}) {
 function formatGeneratorParametersFull(parameters = {}) {
   const lines = Object.entries(parameters || {})
     .filter(([key]) => !(parameters.platform === "jimeng_cli" && ["feature", "motion_control", "edit_instruction"].includes(key)))
-    .filter(([key]) => !(parameters.platform !== "jimeng_cli" && ["mode", "video_resolution"].includes(key)))
+    .filter(([key]) => !(parameters.platform !== "jimeng_cli" && ["mode", "video_resolution", "resolution_type"].includes(key)))
     .filter(([, value]) => value !== undefined && value !== null && value !== "")
     .map(([key, value]) => {
       const text = Array.isArray(value) ? value.join(", ") : String(value);
@@ -712,6 +722,9 @@ function splitParametersByPlatform(platform, parameters = {}) {
   if (source.size != null) common.size = source.size;
   if (source.duration != null) common.duration = source.duration;
   const platformSpecific = {};
+  if (source.mode != null) platformSpecific.mode = source.mode;
+  if (source.video_resolution != null) platformSpecific.video_resolution = source.video_resolution;
+  if (source.resolution_type != null) platformSpecific.resolution_type = source.resolution_type;
   if (source.feature != null) platformSpecific.feature = source.feature;
   if (source.motion_control != null) platformSpecific.motion_control = source.motion_control;
   if (source.edit_instruction != null) platformSpecific.edit_instruction = source.edit_instruction;
@@ -745,11 +758,21 @@ function normalizeGeneratorData(data = {}) {
 
 function generatorParameters(data = {}) {
   const normalized = normalizeGeneratorData(data);
-  return {
+  const merged = {
     ...normalized.common_parameters,
     ...(normalized.platform_parameters?.[normalized.platform] || {}),
     platform: normalized.platform,
   };
+  if (normalized.platform === "jimeng_cli") {
+    delete merged.feature;
+    delete merged.motion_control;
+    delete merged.edit_instruction;
+  } else {
+    delete merged.mode;
+    delete merged.video_resolution;
+    delete merged.resolution_type;
+  }
+  return merged;
 }
 
 function defaultImageParameters() {
@@ -817,6 +840,12 @@ function transitionLabel(value) {
 function shotModelLabel(model) {
   if (!model) return "自动";
   const jimengLabels = {
+    "5.0": "即梦 5.0",
+    "4.6": "即梦 4.6",
+    "4.5": "即梦 4.5",
+    "4.1": "即梦 4.1",
+    "4.0": "即梦 4.0",
+    "3.1": "即梦 3.1",
     "seedance2.0fast": "Seedance 2.0 Fast",
     "seedance2.0": "Seedance 2.0",
     "seedance2.0fast_vip": "Seedance 2.0 Fast VIP",
@@ -844,6 +873,25 @@ function jimengVideoModeLabel(value) {
 
 function jimengVideoModeOptions(mode) {
   return JIMENG_VIDEO_MODELS[mode] || JIMENG_VIDEO_MODELS.text2video;
+}
+
+function jimengImageModeLabel(value) {
+  return JIMENG_IMAGE_MODES.find((item) => item.value === value)?.label || "文生图";
+}
+
+function jimengImageModeOptions(mode) {
+  return JIMENG_IMAGE_MODELS[mode] || JIMENG_IMAGE_MODELS.text2image;
+}
+
+function jimengImageResolutionOptions(mode, model) {
+  if (mode === "image2image") return ["2k", "4k"];
+  return ["3.0", "3.1"].includes(String(model || "").trim()) ? ["1k", "2k"] : ["2k", "4k"];
+}
+
+function jimengModeLabel(value) {
+  if (JIMENG_VIDEO_MODES.some((item) => item.value === value)) return jimengVideoModeLabel(value);
+  if (JIMENG_IMAGE_MODES.some((item) => item.value === value)) return jimengImageModeLabel(value);
+  return value || "";
 }
 
 function parseDurationNumber(value, fallback = 5) {
@@ -3008,15 +3056,19 @@ function renderInspector() {
 function renderGeneratorFields(node) {
   const normalized = normalizeGeneratorData(node.data || {});
   const platform = normalized.platform;
-  const availablePlatforms = node.type === "videoGen" ? GENERATION_PLATFORMS : GENERATION_PLATFORMS.filter((item) => item.value === "lovart");
+  const availablePlatforms = GENERATION_PLATFORMS;
   const safePlatform = availablePlatforms.some((item) => item.value === platform) ? platform : availablePlatforms[0].value;
   const platformOptions = availablePlatforms.map((item) => `<option value="${item.value}" ${safePlatform === item.value ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
   const selected = generatorParameters(normalized);
   const meta = state.params?.model_meta || {};
   const isVideo = node.type === "videoGen";
   const isJimengVideo = safePlatform === "jimeng_cli" && isVideo;
+  const isJimengImage = safePlatform === "jimeng_cli" && !isVideo;
   const jimengMode = isJimengVideo
     ? (JIMENG_VIDEO_MODES.some((item) => item.value === selected.mode) ? selected.mode : (selected.mode || "text2video"))
+    : "";
+  const jimengImageMode = isJimengImage
+    ? (JIMENG_IMAGE_MODES.some((item) => item.value === selected.mode) ? selected.mode : (selected.mode || "text2image"))
     : "";
   let modelOptions = "";
   let sizeOptions = "";
@@ -3045,6 +3097,13 @@ function renderGeneratorFields(node) {
         <div class="hint">支持 ${durationRange.min}-${durationRange.max} 秒</div>
       </label>
     `;
+  } else if (isJimengImage) {
+    const models = jimengImageModeOptions(jimengImageMode);
+    modelValue = models.includes(selected.model) ? selected.model : models[0];
+    const sizeChoices = ["21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"];
+    sizeValue = sizeChoices.includes(selected.size) ? selected.size : (selected.size || "1:1");
+    modelOptions = models.map((model) => `<option value="${escapeHtml(model)}" ${modelValue === model ? "selected" : ""}>${escapeHtml(shotModelLabel(model))}</option>`).join("");
+    sizeOptions = sizeChoices.map((size) => `<option value="${escapeHtml(size)}" ${sizeValue === size ? "selected" : ""}>${escapeHtml(size)}</option>`).join("");
   } else {
     const params = state.params?.[node.type === "imageGen" ? "image" : "video"];
     if (!params) return "";
@@ -3074,6 +3133,9 @@ function renderGeneratorFields(node) {
   const jimengResolutionValue = selected.video_resolution || "720p";
   const jimengModeOptions = JIMENG_VIDEO_MODES.map((item) => `<option value="${item.value}" ${jimengMode === item.value ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
   const jimengResolutionOptions = ["720p", "1080p"].map((item) => `<option value="${item}" ${jimengResolutionValue === item ? "selected" : ""}>${item}</option>`).join("");
+  const jimengImageResolutionValue = selected.resolution_type || "2k";
+  const jimengImageModeOptionsHtml = JIMENG_IMAGE_MODES.map((item) => `<option value="${item.value}" ${jimengImageMode === item.value ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
+  const jimengImageResolutionOptionsHtml = jimengImageResolutionOptions(jimengImageMode, modelValue).map((item) => `<option value="${item}" ${jimengImageResolutionValue === item ? "selected" : ""}>${item}</option>`).join("");
   return `
     <details class="submit-preview-card" open>
       <summary>通用设置</summary>
@@ -3088,6 +3150,12 @@ function renderGeneratorFields(node) {
         <label class="field"><span>视频模式</span><select id="paramMode">${jimengModeOptions}</select></label>
         <label class="field"><span>分辨率</span><select id="paramResolution">${jimengResolutionOptions}</select></label>
         ${jimengMode === "multimodal2video" ? `<div class="hint">这条可接多张图片、视频、音频。至少一张图片或一个视频；如果连的是 URL 素材，提交时会先转成本地文件再交给即梦。</div>` : ""}
+      ` : isJimengImage ? `
+        <label class="field"><span>图片模式</span><select id="paramMode">${jimengImageModeOptionsHtml}</select></label>
+        <label class="field"><span>分辨率</span><select id="paramResolution">${jimengImageResolutionOptionsHtml}</select></label>
+        ${jimengImageMode === "text2image"
+          ? `<div class="hint">文生图不吃参考图；如果你要用图片参考，请切到图生图。</div>`
+          : `<div class="hint">图生图支持 1-10 张图片；如果连的是 URL 图片，提交时会先转成本地文件再交给即梦。</div>`}
       ` : `
         <label class="field"><span>功能选择</span><select id="paramFeature">${featureOptions}</select></label>
         ${needsMotion ? `<label class="field"><span>动作控制</span><textarea id="paramMotion" placeholder="例如：镜头缓慢前推，人物向右转身，手臂自然摆动">${escapeHtml(selected.motion_control || "")}</textarea></label>` : ""}
@@ -3119,6 +3187,24 @@ function bindGeneratorFields(node) {
     const preferredImageModel = firstAvailableModel("image", "generate_image_nano_banana_pro");
     if (!nextCommon.model || nextCommon.model === "agent-auto") {
       nextCommon.model = preferredImageModel;
+      changed = true;
+    }
+  } else if (node.type === "imageGen" && normalized.platform === "jimeng_cli") {
+    const jimengMode = nextPlatformParameters.jimeng_cli?.mode || "text2image";
+    if (!nextCommon.model || !jimengImageModeOptions(jimengMode).includes(nextCommon.model)) {
+      nextCommon.model = "5.0";
+      changed = true;
+    }
+    if (!nextCommon.size) {
+      nextCommon.size = "1:1";
+      changed = true;
+    }
+    if (!nextPlatformParameters.jimeng_cli?.mode) {
+      nextPlatformParameters.jimeng_cli.mode = "text2image";
+      changed = true;
+    }
+    if (!nextPlatformParameters.jimeng_cli?.resolution_type) {
+      nextPlatformParameters.jimeng_cli.resolution_type = "2k";
       changed = true;
     }
   }
@@ -3180,6 +3266,17 @@ function bindGeneratorFields(node) {
             ...(recommended.mode ? { mode: recommended.mode } : {}),
           },
         };
+      } else if (key === "model" && node.type === "imageGen" && current.platform === "jimeng_cli") {
+        const currentMode = current.platform_parameters?.jimeng_cli?.mode || "text2image";
+        const validResolutions = jimengImageResolutionOptions(currentMode, value);
+        const currentResolution = current.platform_parameters?.jimeng_cli?.resolution_type || "2k";
+        patch.platform_parameters = {
+          ...(current.platform_parameters || {}),
+          jimeng_cli: {
+            ...(current.platform_parameters?.jimeng_cli || {}),
+            resolution_type: validResolutions.includes(currentResolution) ? currentResolution : validResolutions[0],
+          },
+        };
       }
       patchNodeData(node.id, patch);
       if (key === "model") renderInspector();
@@ -3198,7 +3295,7 @@ function bindGeneratorFields(node) {
           },
         },
       });
-      if (key === "feature") renderInspector();
+      if (key === "feature" || key === "mode" || key === "resolution_type" || key === "video_resolution") renderInspector();
     });
   };
   const bindPlatformText = (el, key) => {
@@ -3223,14 +3320,35 @@ function bindGeneratorFields(node) {
       const currentParams = generatorParameters(current);
       const split = splitParametersByPlatform(nextPlatform, currentParams);
       const recommended = node.type === "videoGen" ? recommendedVideoBehavior(nextPlatform, currentParams.model) : {};
+      const nextCommon = { ...(current.common_parameters || {}), ...split.common };
+      const nextPlatformSpecific = {
+        ...(split.platformSpecific[nextPlatform] || {}),
+        ...(current.platform_parameters?.[nextPlatform] || {}),
+      };
+      if (node.type === "imageGen") {
+        if (nextPlatform === "jimeng_cli") {
+          nextCommon.model = "5.0";
+          nextCommon.size = nextCommon.size || "1:1";
+          nextPlatformSpecific.mode = "text2image";
+          nextPlatformSpecific.resolution_type = "2k";
+          delete nextPlatformSpecific.feature;
+          delete nextPlatformSpecific.motion_control;
+          delete nextPlatformSpecific.edit_instruction;
+        } else {
+          nextCommon.model = firstAvailableModel("image", "generate_image_nano_banana_pro");
+          nextPlatformSpecific.feature = nextPlatformSpecific.feature || "auto";
+          delete nextPlatformSpecific.mode;
+          delete nextPlatformSpecific.resolution_type;
+          delete nextPlatformSpecific.video_resolution;
+        }
+      }
       patchNodeData(node.id, {
         platform: nextPlatform,
-        common_parameters: { ...(current.common_parameters || {}), ...split.common },
+        common_parameters: nextCommon,
         platform_parameters: {
           ...(current.platform_parameters || {}),
           [nextPlatform]: {
-            ...(split.platformSpecific[nextPlatform] || {}),
-            ...(current.platform_parameters?.[nextPlatform] || {}),
+            ...nextPlatformSpecific,
             ...(recommended.feature ? { feature: recommended.feature } : {}),
             ...(recommended.mode ? { mode: recommended.mode } : {}),
           },
@@ -3244,7 +3362,9 @@ function bindGeneratorFields(node) {
   bindCommon(size, "size");
   bindCommon(duration, "duration");
   bindPlatform(mode, "mode");
-  bindPlatform(resolution, "video_resolution");
+  if (resolution) {
+    bindPlatform(resolution, node.type === "imageGen" && normalized.platform === "jimeng_cli" ? "resolution_type" : "video_resolution");
+  }
   bindPlatformText(motion, "motion_control");
   bindPlatformText(edit, "edit_instruction");
   document.querySelectorAll("[data-asset-role]").forEach((select) => {

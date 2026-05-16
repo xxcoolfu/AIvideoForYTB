@@ -835,6 +835,9 @@ function splitParametersByPlatform(platform, parameters = {}) {
   if (source.size != null) common.size = source.size;
   if (source.duration != null) common.duration = source.duration;
   const platformSpecific = {};
+  if (source.mode != null) platformSpecific.mode = source.mode;
+  if (source.video_resolution != null) platformSpecific.video_resolution = source.video_resolution;
+  if (source.resolution_type != null) platformSpecific.resolution_type = source.resolution_type;
   if (source.feature != null) platformSpecific.feature = source.feature;
   if (source.motion_control != null) platformSpecific.motion_control = source.motion_control;
   if (source.edit_instruction != null) platformSpecific.edit_instruction = source.edit_instruction;
@@ -880,6 +883,7 @@ function generatorParameters(data = {}) {
   } else {
     delete merged.mode;
     delete merged.video_resolution;
+    delete merged.resolution_type;
   }
   return merged;
 }
@@ -1193,32 +1197,60 @@ function jimengOrderedInputs(job, canvas) {
 }
 
 async function runJimengJob(projectId, job, canvas) {
-  if (job.kind !== "video") {
-    return { ok: false, reason: "这轮即梦 CLI 先只接视频节点，图片节点还没接。" };
-  }
   const dir = projectDir(projectId);
-  const outputDir = path.join(dir, "videos");
+  const outputDir = path.join(dir, job.kind === "image" ? "images" : "videos");
   ensureDir(outputDir);
   const logFile = path.join(dir, "logs", `${job.job_id}.log`);
-  const mode = String(job.parameters?.mode || "text2video").trim();
+  const mode = String(job.parameters?.mode || (job.kind === "image" ? "text2image" : "text2video")).trim();
   const orderedInputs = jimengOrderedInputs(job, canvas);
   const imageInputs = orderedInputs.filter((item) => item.asset?.kind === "image");
   const videoInputs = orderedInputs.filter((item) => item.asset?.kind === "video");
   const audioInputs = orderedInputs.filter((item) => item.asset?.kind === "audio");
 
   const args = [mode];
-  const referencePrompt = buildJimengReferencePrompt(orderedInputs, mode);
+  const referencePrompt = job.kind === "video" ? buildJimengReferencePrompt(orderedInputs, mode) : "";
   const prompt = [String(job.prompt || "").trim(), referencePrompt].filter(Boolean).join("\n\n");
   if (prompt) args.push("--prompt", prompt);
 
-  const model = normalizeJimengModel(job.parameters?.model);
+  const model = normalizeJimengModel(job.parameters?.model, job.kind === "image" ? "5.0" : "seedance2.0fast");
   if (model) args.push("--model_version", model);
-  const duration = parseDurationSeconds(job.parameters?.duration, 5);
-  args.push("--duration", String(duration));
-  const videoResolution = String(job.parameters?.video_resolution || "720p").trim();
-  if (videoResolution) args.push("--video_resolution", videoResolution);
+  if (job.kind === "video") {
+    const duration = parseDurationSeconds(job.parameters?.duration, 5);
+    args.push("--duration", String(duration));
+    const videoResolution = String(job.parameters?.video_resolution || "720p").trim();
+    if (videoResolution) args.push("--video_resolution", videoResolution);
+  }
 
-  if (mode === "text2video") {
+  if (job.kind === "image" && mode === "text2image") {
+    if (imageInputs.length || videoInputs.length || audioInputs.length) {
+      return { ok: false, reason: "当前是文生图，不会带参考图。要用图片，请切到图生图。" };
+    }
+    const ratio = String(job.parameters?.size || "").trim();
+    if (ratio) args.push("--ratio", ratio);
+    const resolutionType = String(job.parameters?.resolution_type || "2k").trim();
+    if (resolutionType) args.push("--resolution_type", resolutionType);
+  } else if (job.kind === "image" && mode === "image2image") {
+    if (!imageInputs.length) {
+      return { ok: false, reason: "即梦图生图至少需要 1 张图片。" };
+    }
+    if (imageInputs.length > 10) {
+      return { ok: false, reason: "即梦图生图当前最多支持 10 张图片，请先减少一些。" };
+    }
+    if (videoInputs.length || audioInputs.length) {
+      return { ok: false, reason: "即梦图生图当前只支持图片，先把视频和音频断开。" };
+    }
+    for (const item of imageInputs) {
+      const localPath = await ensureJimengLocalAsset(projectId, item.asset);
+      if (!localPath || !fs.existsSync(localPath)) {
+        return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
+      }
+      args.push("--images", localPath);
+    }
+    const ratio = String(job.parameters?.size || "").trim();
+    if (ratio) args.push("--ratio", ratio);
+    const resolutionType = String(job.parameters?.resolution_type || "2k").trim();
+    if (resolutionType) args.push("--resolution_type", resolutionType);
+  } else if (mode === "text2video") {
     if (imageInputs.length || videoInputs.length || audioInputs.length) {
       return { ok: false, reason: "当前即梦模式是文生视频，不会带参考素材。要用图片，请切到“单图生视频”；多图参考等“全能参考视频”接入后再用。" };
     }
@@ -1278,7 +1310,7 @@ async function runJimengJob(projectId, job, canvas) {
     const ratio = String(job.parameters?.size || "").trim();
     if (ratio) args.push("--ratio", ratio);
   } else {
-    return { ok: false, reason: `即梦视频模式暂不支持：${mode}` };
+    return { ok: false, reason: `即梦${job.kind === "image" ? "图片" : "视频"}模式暂不支持：${mode}` };
   }
 
   job.submitted_prompt = prompt;
@@ -1376,7 +1408,7 @@ async function refreshDreaminaJob(projectId, job) {
     return { ok: false, pending: true, status: "running", reason: "即梦仍在生成中。" };
   }
   if (genStatus !== "success") {
-    return { ok: false, reason: `即梦任务状态：${genStatus || "未知"}` };
+    return { ok: false, reason: "即梦平台退回失败。" };
   }
   const created = assetsFromDreaminaResult(projectId, job, parsed);
   if (!created.length) {
@@ -2330,9 +2362,6 @@ async function handleApi(req, res) {
     const kind = targetNode.type === "imageGen" ? "image" : "video";
     const generatorData = normalizeGeneratorData(targetNode.data || {});
     const platform = generatorData.platform;
-    if (platform === "jimeng_cli" && kind !== "video") {
-      return send(res, 400, { ok: false, error: "这轮先接即梦视频节点，图片节点后面再接。" });
-    }
     if (!ENABLED_PLATFORMS.has(platform)) {
       return send(res, 400, {
         ok: false,
