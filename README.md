@@ -20,6 +20,140 @@ node server.js
 http://localhost:4173
 ```
 
+## 给朋友的最小安装说明
+
+如果只是把这个仓库给朋友自己改改，最少先确认 3 类环境：
+
+1. `Node.js`
+2. `dreamina` CLI
+3. `ffmpeg / ffprobe`
+
+### 1. 安装 Node.js
+
+安装最新版 LTS：
+
+[https://nodejs.org/](https://nodejs.org/)
+
+安装后确认：
+
+```bash
+node -v
+```
+
+### 2. 安装即梦 CLI
+
+先确认终端里能直接运行：
+
+```bash
+dreamina --help
+dreamina user_credit
+```
+
+如果还没装，请按即梦官方方式安装并登录。
+
+### 3. 安装 ffmpeg
+
+macOS 如果已经有 Homebrew：
+
+```bash
+brew install ffmpeg
+```
+
+安装后确认：
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+### 4. 安装 Lovart skill
+
+本项目依赖本机可用的 `agent_skill.py`。
+
+常见路径：
+
+macOS：
+
+```text
+~/.codex/skills/lovart-skill/agent_skill.py
+```
+
+Windows：
+
+```text
+C:\Users\你的用户名\.codex\skills\lovart-skill\agent_skill.py
+```
+
+如果本机没有这个 skill，需要先装好 Lovart skill。
+
+### 5. 启动画布
+
+macOS：
+
+- 双击 `启动AI视频画布.command`
+
+Windows：
+
+- 双击 `启动AI视频画布.bat`
+
+启动后浏览器会打开：
+
+```text
+http://127.0.0.1:4173/
+```
+
+### 6. 第一次打开必须配置
+
+在左侧 **Lovart 配置** 里填写：
+
+- `Access Key`
+- `Secret Key`
+- `Lovart skill 路径`
+
+这里的路径必须改成自己机器上的 `agent_skill.py` 路径。
+
+### 7. 最后检查 3 件事
+
+只要下面这几条都通，基本就能用了：
+
+```bash
+node -v
+dreamina --help
+ffmpeg -version
+```
+
+再人工确认：
+
+- 左侧 `Lovart 配置` 里的 key 和 skill 路径，已经改成自己机器上的值
+
+### 常见问题
+
+#### 即梦不能提交
+
+先检查：
+
+```bash
+dreamina --help
+dreamina user_credit
+```
+
+#### 提取尾帧很慢或不工作
+
+先检查：
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+#### Lovart 提交失败
+
+优先检查左侧配置里这 3 项是不是已经换成自己的：
+
+- `Access Key`
+- `Secret Key`
+- `Lovart skill 路径`
+
 ## Lovart 调用配置
 
 本项目通过 Lovart 官方 `lovart-skill` 里的 `agent_skill.py` 调用 Lovart Agent OpenAPI，不依赖 OpenClaw Desktop。
