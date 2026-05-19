@@ -7,12 +7,15 @@ process.env.AI_VIDEO_PROJECTS_DIR = path.join(__dirname, "projects");
 
 const {
   assetsFromLovartResult,
+  assetTemplateOutputName,
   buildTags,
   cleanGeneratedAssets,
   connectImageResultsToShotVideo,
   createProject,
   loadProject,
   placeResultNodes,
+  parseShotlistHtml,
+  parseAssetLibraryJsonl,
   parseShots,
   recordProcessedDownloads,
   safeName,
@@ -43,6 +46,53 @@ assert.deepEqual(doctor.bound_asset_ids, ["asset_1"]);
 assert.deepEqual(doctor.referenced_by_shot_ids, ["1", "2"]);
 
 assert.equal(safeName('a/b:c*?"<>|'), "a_b_c______");
+
+const jsonlLibrary = parseAssetLibraryJsonl(`{"asset":"Jack Blackwood","category":"character","filename":"jack_blackwood.png","use":"Main character identity anchor for ship, beach, jungle, and camp scenes.","prompt":"portrait prompt","negative":"bad hands","source_file":"01_角色资产.md"}`);
+assert.equal(jsonlLibrary.templates.length, 1);
+assert.equal(jsonlLibrary.templates[0].label, "jack_blackwood");
+assert.equal(jsonlLibrary.templates[0].filename, "jack_blackwood.png");
+assert.ok(jsonlLibrary.templates[0].source_body.includes("portrait prompt"));
+assert.ok(jsonlLibrary.templates[0].source_body.includes("Negative prompt: bad hands"));
+assert.equal(assetTemplateOutputName({ asset_template_label: "jack_blackwood.png", asset_template_filename: "jack_blackwood.png" }), "jack_blackwood");
+
+const htmlShots = parseShotlistHtml(`
+  <h2 class="block-title">Episode 1 — Fog Island</h2>
+  <tr data-scene="9" data-plan="WS"><td>9.1</td><td class="c-prompt" rowspan="2">
+    <div class="prompt-head"><b>提示词 11</b> <span>[ECU→WS · rope knot]</span></div>
+    <div class="prompt-block">@Night Beach Camp
+【镜头1】动作：Billy消失，只留下绳结。
+8秒。21:9。</div>
+  </td></tr>
+`, "lovart");
+assert.equal(htmlShots.length, 1);
+assert.equal(htmlShots[0].shot_id, "分镜1-9-11");
+assert.equal(htmlShots[0].transition, "video_direct");
+assert.equal(htmlShots[0].image_prompt, "");
+assert.equal(htmlShots[0].duration, "8s");
+assert.equal(htmlShots[0].size, "21:9");
+assert.equal(htmlShots[0].video_model, "generate_video_seedance_v2_0_fast");
+
+const sectionHtmlShots = parseShotlistHtml(`
+  <h2 class="block-title">Episode 1 — Fog Island</h2>
+  <section class="scene" id="sc9">
+    <tr data-scene="9"><td class="c-prompt">
+      <div class="prompt-head"><b>提示词 11</b></div>
+      <div class="prompt-block">@Night Beach Camp — foggy camp.
+8秒。21:9。</div>
+    </td></tr>
+  </section>
+  <section class="scene" id="sc10">
+    <tr data-scene="10"><td class="c-prompt">
+      <div class="prompt-head"><b>提示词 12</b></div>
+      <div class="prompt-block">@Fog Island Aerial — fog island.
+10秒。21:9。</div>
+    </td></tr>
+  </section>
+`, "lovart");
+assert.equal(sectionHtmlShots.length, 2);
+assert.equal(sectionHtmlShots[1].shot_id, "分镜1-10-12");
+assert.ok(sectionHtmlShots[0].tag_refs.includes("@Night Beach Camp"));
+assert.ok(!sectionHtmlShots[0].tag_refs.includes("@Night"));
 
 const project = createProject("测试项目");
 assert.equal(project.project.project_id, "测试项目");

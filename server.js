@@ -132,6 +132,14 @@ function extensionFromMime(mime = "", fallback = ".bin") {
   return map[String(mime || "").toLowerCase()] || fallback;
 }
 
+function assetKindFromFile(file, fallback = "image") {
+  const ext = path.extname(String(file || "")).toLowerCase();
+  if ([".mp4", ".mov", ".webm"].includes(ext)) return "video";
+  if ([".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(ext)) return "image";
+  if ([".mp3", ".wav", ".m4a", ".aac"].includes(ext)) return "audio";
+  return fallback;
+}
+
 function renameFileForAsset(projectId, asset, nextName) {
   const cleanName = safeName(nextName);
   if (!cleanName || !asset.file_path || !fs.existsSync(asset.file_path)) {
@@ -169,6 +177,8 @@ function loadProject(projectId) {
     asset_library: readJson(path.join(dir, "asset_library.json"), { global_rules: "", templates: [], image_model: "agent-auto" }),
   };
   migrateLovartMeta(projectId, data);
+  repairAssetKindsFromFiles(projectId, data);
+  reconcileDownloadedJobAssets(projectId, data);
   return data;
 }
 
@@ -176,6 +186,42 @@ function saveProjectPart(projectId, fileName, value) {
   const dir = projectDir(projectId);
   ensureDir(dir);
   writeJson(path.join(dir, fileName), value);
+}
+
+function mergeCanvasForSave(projectId, incomingCanvas = {}) {
+  const current = readJson(path.join(projectDir(projectId), "canvas.json"), { nodes: [], edges: [], assets: [] });
+  const next = {
+    nodes: Array.isArray(incomingCanvas.nodes) ? incomingCanvas.nodes : [],
+    edges: Array.isArray(incomingCanvas.edges) ? incomingCanvas.edges : [],
+    assets: Array.isArray(incomingCanvas.assets) ? incomingCanvas.assets : [],
+  };
+  const nextAssetIds = new Set(next.assets.map((asset) => asset.asset_id).filter(Boolean));
+  const preservedAssets = (current.assets || []).filter((asset) => {
+    if (!asset.asset_id || nextAssetIds.has(asset.asset_id)) return false;
+    return asset.source === "generated" || asset.source_job_id || asset.asset_template_id;
+  });
+  next.assets.push(...preservedAssets);
+
+  const nextNodeIds = new Set(next.nodes.map((node) => node.id).filter(Boolean));
+  const preservedAssetIds = new Set(preservedAssets.map((asset) => asset.asset_id).filter(Boolean));
+  const preservedNodes = (current.nodes || []).filter((node) => {
+    if (!node.id || nextNodeIds.has(node.id)) return false;
+    return node.data?.source_job_id || preservedAssetIds.has(node.data?.asset_id);
+  });
+  next.nodes.push(...preservedNodes);
+  preservedNodes.forEach((node) => nextNodeIds.add(node.id));
+
+  const edgeKey = (edge) => `${edge.source || ""}->${edge.target || ""}`;
+  const nextEdgeKeys = new Set(next.edges.map(edgeKey));
+  for (const edge of current.edges || []) {
+    if (!edge.source || !edge.target) continue;
+    if (!nextNodeIds.has(edge.source) || !nextNodeIds.has(edge.target)) continue;
+    const key = edgeKey(edge);
+    if (nextEdgeKeys.has(key)) continue;
+    next.edges.push(edge);
+    nextEdgeKeys.add(key);
+  }
+  return next;
 }
 
 function saveProjectMeta(projectId, patch) {
@@ -219,6 +265,27 @@ function migrateLovartMeta(projectId, data) {
       job.status = "rate_limited";
       jobsChanged = true;
     }
+    if (job.platform === "lovart" && job.lovart_thread_id && job.status === "failed" && isLovartInteractionPrompt(job.failure_reason)) {
+      job.status = "needs_input";
+      jobsChanged = true;
+    }
+    if (job.status === "pending_confirmation" && /已确认，Lovart 正在继续生成/.test(String(job.failure_reason || ""))) {
+      job.status = "running";
+      jobsChanged = true;
+    }
+    if (
+      job.status === "running"
+      && !job.lovart_thread_id
+      && !job.jimeng_submit_id
+      && Date.now() - new Date(job.updated_at || job.created_at || 0).getTime() > 10 * 60 * 1000
+    ) {
+      job.status = "failed";
+      job.failure_reason = "本地提交中断：没有拿到平台会话 ID，无法继续查询结果。请重新提交。";
+      job.updated_at = now();
+      updateAssetLibraryAfterJob(projectId, job, { status: "failed", failure_reason: job.failure_reason });
+      jobsChanged = true;
+      continue;
+    }
     if (job.lovart_project_id && job.lovart_thread_id) continue;
     const meta = parseLovartMetaFromLog(projectId, job.job_id);
     if (meta.lovart_project_id && !job.lovart_project_id) {
@@ -237,6 +304,34 @@ function migrateLovartMeta(projectId, data) {
   }
   if (projectChanged) writeJson(path.join(projectDir(projectId), "project.json"), data.project);
   if (jobsChanged) writeJson(path.join(projectDir(projectId), "jobs.json"), data.jobs);
+}
+
+function repairAssetKindsFromFiles(projectId, data) {
+  if (!data?.canvas) return false;
+  data.canvas.assets = Array.isArray(data.canvas.assets) ? data.canvas.assets : [];
+  data.canvas.nodes = Array.isArray(data.canvas.nodes) ? data.canvas.nodes : [];
+  let changed = false;
+  const assetKindById = new Map();
+  for (const asset of data.canvas.assets) {
+    if (!asset.file_path && !asset.url) continue;
+    const nextKind = assetKindFromFile(asset.file_path || asset.url, asset.kind || "image");
+    if (nextKind && asset.kind !== nextKind) {
+      asset.kind = nextKind;
+      if (nextKind === "image") asset.thumbnail_path = asset.file_path || asset.thumbnail_path;
+      if (nextKind !== "image" && asset.thumbnail_path === asset.file_path) asset.thumbnail_path = undefined;
+      changed = true;
+    }
+    if (asset.asset_id) assetKindById.set(asset.asset_id, asset.kind);
+  }
+  for (const node of data.canvas.nodes) {
+    const assetKind = assetKindById.get(node.data?.asset_id);
+    if (assetKind && ["image", "video", "audio"].includes(node.type) && node.type !== assetKind) {
+      node.type = assetKind;
+      changed = true;
+    }
+  }
+  if (changed) saveProjectPart(projectId, "canvas.json", data.canvas);
+  return changed;
 }
 
 function createProject(name) {
@@ -316,12 +411,35 @@ function parseShots(text) {
 }
 
 function extractTags(text) {
-  return Array.from(new Set((String(text || "").match(/@(?:[A-Za-z][A-Za-z0-9_\-·]*|[\p{Script=Han}\p{N}_\-·]+)/gu) || []).map((x) => x.trim())));
+  const source = String(text || "");
+  const refs = new Set();
+  for (const match of source.matchAll(/^\s*@([^@\n]{1,120}?)\s+[—–-]\s+/gmu)) {
+    const label = String(match[1] || "").replace(/\s+/g, " ").trim();
+    if (label) refs.add(`@${label}`);
+  }
+  for (const token of source.match(/@(?:[A-Za-z][A-Za-z0-9_\-·]*|[\p{Script=Han}\p{N}_\-·]+)/gu) || []) {
+    const label = token.trim();
+    const isShortPrefix = Array.from(refs).some((fullLabel) => fullLabel !== label && fullLabel.startsWith(`${label} `));
+    if (!isShortPrefix) refs.add(label);
+  }
+  return Array.from(refs);
 }
 
 function extractDurationFromPrompt(text) {
-  const match = String(text || "").match(/\[\s*总时长\s*[：:]\s*(\d+)\s*秒\s*\]/);
-  return match?.[1] ? `${match[1]}s` : "";
+  const source = String(text || "");
+  const explicit = source.match(/\[\s*总时长\s*[：:]\s*(\d+)\s*秒\s*\]/);
+  if (explicit?.[1]) return `${explicit[1]}s`;
+  const compact = source.match(/(?:^|\n)\s*(\d+)\s*秒\s*[。.\s]*(?:\d+\s*:\s*\d+)?\s*[。.\s]*$/);
+  return compact?.[1] ? `${compact[1]}s` : "";
+}
+
+function extractAspectRatioFromPrompt(text) {
+  const match = String(text || "").match(/(?:^|\n|。|\s)(\d+\s*:\s*\d+)\s*[。.\s]*$/);
+  return match?.[1] ? match[1].replace(/\s+/g, "") : "";
+}
+
+function isLovartInteractionPrompt(message) {
+  return /你希望如何处理|请选择|请确认|确认此|确认.*生成|是否开始|是否|要继续|继续生成|如何处理|which option|how would you like|would you like|\?|？/i.test(String(message || ""));
 }
 
 function isKlingModelName(value) {
@@ -412,6 +530,7 @@ function normalizeShot(raw, previousShotId = "", preferredSeedancePlatform = "lo
   const video_prompt = String(raw.video_prompt || "").trim();
   const normalizedPlatformAndModel = normalizeShotPlatformAndModel(raw.platform, raw.video_model, transition, raw.seedance_platform || preferredSeedancePlatform);
   const duration = String(raw.duration || extractDurationFromPrompt(video_prompt) || "").trim();
+  const size = String(raw.size || extractAspectRatioFromPrompt(video_prompt) || "").trim();
   const prompt = [image_prompt, video_prompt].filter(Boolean).join("\n\n");
   const providedTags = Array.isArray(raw.tag_refs)
     ? Array.from(new Set(raw.tag_refs.map((item) => String(item || "").trim()).filter(Boolean)))
@@ -425,6 +544,7 @@ function normalizeShot(raw, previousShotId = "", preferredSeedancePlatform = "lo
     video_prompt,
     video_model: normalizedPlatformAndModel.video_model,
     duration,
+    size,
     prompt,
     tag_refs: providedTags || extractTags(prompt),
     expected_prev_shot_id: transition === "continue_prev_tail" ? String(raw.expected_prev_shot_id || previousShotId || "").trim() : "",
@@ -481,6 +601,69 @@ function parseAssetLibraryMarkdown(text, previousLibrary = defaultAssetLibrary()
   };
 }
 
+function assetTemplateDefaultSize(category) {
+  if (category === "character") return "9:16";
+  if (category === "scene") return "16:9";
+  return "1:1";
+}
+
+function assetNameFromFilename(filename, fallback) {
+  const raw = String(filename || "").trim() || String(fallback || "").trim() || "asset";
+  const base = path.basename(raw);
+  const ext = path.extname(base);
+  return safeName(ext ? path.basename(base, ext) : base);
+}
+
+function parseAssetLibraryJsonl(text, previousLibrary = defaultAssetLibrary()) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
+  const previousByKey = new Map();
+  for (const item of previousLibrary.templates || []) {
+    const keys = [
+      item.filename ? `filename:${String(item.filename).toLowerCase()}` : "",
+      item.label ? `label:${String(item.label).toLowerCase()}` : "",
+    ].filter(Boolean);
+    keys.forEach((key) => previousByKey.set(key, item));
+  }
+  const templates = [];
+  lines.forEach((line, index) => {
+    const sourceLine = line.trim();
+    if (!sourceLine) return;
+    let row;
+    try {
+      row = JSON.parse(sourceLine);
+    } catch {
+      throw new Error(`资产 JSONL 第 ${index + 1} 行不是有效 JSON。`);
+    }
+    const filename = String(row.filename || "").trim();
+    const label = assetNameFromFilename(filename, row.asset);
+    const category = String(row.category || "other").trim() || "other";
+    const prompt = String(row.prompt || "").trim();
+    const negative = String(row.negative || "").trim();
+    if (!prompt) return;
+    const source_body = [prompt, negative ? `Negative prompt: ${negative}` : ""].filter(Boolean).join("\n\n");
+    const previous = previousByKey.get(`filename:${filename.toLowerCase()}`) || previousByKey.get(`label:${label.toLowerCase()}`);
+    templates.push({
+      template_id: previous?.template_id || id("assettpl"),
+      label,
+      filename: filename || `${label}.png`,
+      category,
+      use: String(row.use || "").trim(),
+      source_file: String(row.source_file || "").trim(),
+      source_body,
+      combined_prompt: source_body,
+      default_size: previous?.default_size || assetTemplateDefaultSize(category),
+      generated_asset_ids: previous?.generated_asset_ids || [],
+      status: previous?.status || "idle",
+      failure_reason: previous?.failure_reason,
+    });
+  });
+  return {
+    global_rules: previousLibrary.global_rules || "",
+    image_model: previousLibrary.image_model || "agent-auto",
+    templates,
+  };
+}
+
 function buildTags(shots, previousTags) {
   const previous = new Map(previousTags.map((tag) => [tag.label, tag]));
   const refs = new Map();
@@ -532,42 +715,101 @@ function localAssetExists(asset) {
   return Boolean(asset?.file_path && fs.existsSync(asset.file_path));
 }
 
+function comparableAssetName(value) {
+  return path.basename(String(value || "").trim().replace(/^@/, ""), path.extname(String(value || "")))
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, "");
+}
+
+function localAssetNameCandidates(asset = {}, hint = {}) {
+  const values = [
+    asset.name,
+    asset.asset_id,
+    hint.asset_name,
+    hint.source_node_title,
+    hint.primary_tag_label,
+    ...(hint.tag_labels || []),
+  ];
+  for (const value of [asset.file_path, asset.external_url, asset.url]) {
+    if (value) values.push(path.basename(String(value).split("?")[0].split("#")[0]));
+  }
+  return Array.from(new Set(values.map(comparableAssetName).filter(Boolean)));
+}
+
+function findExistingLocalAssetFile(projectId, asset = {}, hint = {}) {
+  const candidates = new Set(localAssetNameCandidates(asset, hint));
+  if (!candidates.size) return "";
+  const dirs = [
+    path.join(projectDir(projectId), "images"),
+    path.join(projectDir(projectId), "input"),
+    path.join(projectDir(projectId), "videos"),
+  ];
+  const allowed = asset.kind === "video"
+    ? [".mp4", ".mov", ".webm"]
+    : asset.kind === "audio"
+      ? [".mp3", ".wav", ".m4a", ".aac"]
+      : [".png", ".jpg", ".jpeg", ".webp", ".gif"];
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir)) {
+      const ext = path.extname(name).toLowerCase();
+      if (!allowed.includes(ext)) continue;
+      const stem = comparableAssetName(name);
+      if (candidates.has(stem)) return path.join(dir, name);
+    }
+  }
+  return "";
+}
+
 function downloadRemoteFile(fileUrl, destWithoutExt) {
   return new Promise((resolve, reject) => {
-    const urlObject = new URL(fileUrl);
-    const client = urlObject.protocol === "https:" ? https : http;
-    const request = client.get(urlObject, (response) => {
-      if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        response.resume();
-        const redirected = new URL(response.headers.location, fileUrl).toString();
-        resolve(downloadRemoteFile(redirected, destWithoutExt));
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`下载失败，状态码 ${response.statusCode || "未知"}`));
-        return;
-      }
-      const headerType = String(response.headers["content-type"] || "").split(";")[0].trim();
-      const urlExt = path.extname(urlObject.pathname || "");
-      const ext = urlExt || extensionFromMime(headerType, ".bin");
-      const finalPath = uniquePath(path.dirname(destWithoutExt), `${path.basename(destWithoutExt)}${ext}`);
-      const stream = fs.createWriteStream(finalPath);
-      response.pipe(stream);
-      stream.on("finish", () => {
-        stream.close(() => resolve({ filePath: finalPath, contentType: headerType }));
-      });
-      stream.on("error", (error) => {
-        try { fs.unlinkSync(finalPath); } catch {}
-        reject(error);
-      });
+    let urlObject;
+    try {
+      urlObject = new URL(fileUrl);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const urlExt = path.extname(urlObject.pathname || "");
+    const finalPath = uniquePath(path.dirname(destWithoutExt), `${path.basename(destWithoutExt)}${urlExt || ".bin"}`);
+    const child = spawn("curl", [
+      "-L",
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "15",
+      "--max-time",
+      "120",
+      "--output",
+      finalPath,
+      fileUrl,
+    ], { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.on("error", (error) => {
+      try { fs.unlinkSync(finalPath); } catch {}
+      reject(error);
     });
-    request.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({ filePath: finalPath, contentType: "" });
+        return;
+      }
+      try { fs.unlinkSync(finalPath); } catch {}
+      reject(new Error(stderr.trim() || `curl 下载失败，退出码 ${code}`));
+    });
   });
 }
 
-async function ensureJimengLocalAsset(projectId, asset) {
+async function ensureJimengLocalAsset(projectId, asset, hint = {}) {
   if (localAssetExists(asset)) return asset.file_path;
+  const existingFile = findExistingLocalAssetFile(projectId, asset, hint);
+  if (existingFile) {
+    asset.file_path = existingFile;
+    if (!asset.thumbnail_path && asset.kind === "image") asset.thumbnail_path = existingFile;
+    return existingFile;
+  }
   const fileUrl = remoteAssetUrl(asset);
   if (!fileUrl) return "";
   const cacheDir = path.join(projectDir(projectId), "input");
@@ -639,7 +881,13 @@ function parseJsonFromOutput(output) {
 }
 
 function isConcurrentLimit(message) {
-  return /Concurrent task limit|并发|concurrent/i.test(String(message || ""));
+  return /Concurrent task limit|ExceedConcurrencyLimit|ConcurrencyLimit|并发|concurrent|concurrency/i.test(String(message || ""));
+}
+
+function jimengFailureReason(parsed = {}, fallback = "即梦平台退回失败。") {
+  const reason = String(parsed.fail_reason || parsed.message || parsed.error || "").trim();
+  if (isConcurrentLimit(reason)) return "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
+  return reason || fallback;
 }
 
 function collectInputs(canvas, nodeIds) {
@@ -1020,6 +1268,84 @@ async function parseShotsXlsx(buffer, projectId, preferredSeedancePlatform = "lo
   }
 }
 
+function decodeHtmlEntities(text) {
+  const named = {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+    rarr: "→",
+    mdash: "—",
+    ndash: "–",
+  };
+  return String(text || "").replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (all, entity) => {
+    if (entity[0] === "#") {
+      const value = entity[1]?.toLowerCase() === "x" ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
+      return Number.isFinite(value) ? String.fromCodePoint(value) : all;
+    }
+    return named[entity] || all;
+  });
+}
+
+function htmlToPlainText(html) {
+  return decodeHtmlEntities(String(html || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(?:p|div|li|tr|td|h\d)>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim());
+}
+
+function parseShotlistHtml(html, preferredSeedancePlatform = "lovart") {
+  const source = String(html || "").replace(/\r\n/g, "\n");
+  const episode = source.match(/Episode\s*(\d+)/i)?.[1] || "1";
+  const shots = [];
+  const sections = [];
+  const sectionRegex = /<section\b([^>]*)>([\s\S]*?)<\/section>/gi;
+  let sectionMatch;
+  while ((sectionMatch = sectionRegex.exec(source))) {
+    const attrs = sectionMatch[1] || "";
+    const body = sectionMatch[2] || "";
+    const scene = attrs.match(/\bid=["']sc(\d+)["']/i)?.[1] || body.match(/SCENE\s*(\d+)/i)?.[1] || "";
+    sections.push({ scene, body });
+  }
+  const blocks = sections.length ? sections : [{ scene: "", body: source }];
+  const rowPromptRegex = /<tr\b([^>]*)\bdata-scene=["']([^"']+)["'][^>]*>([\s\S]*?)<td\b[^>]*class=["'][^"']*\bc-prompt\b[^"']*["'][^>]*>([\s\S]*?)<\/td>/gi;
+  for (const block of blocks) {
+    let match;
+    rowPromptRegex.lastIndex = 0;
+    while ((match = rowPromptRegex.exec(block.body))) {
+      const scene = String(match[2] || block.scene || "").trim();
+      const promptCell = match[4] || "";
+      const headMatch = promptCell.match(/<div\b[^>]*class=["'][^"']*\bprompt-head\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+      const promptBlockMatch = promptCell.match(/<div\b[^>]*class=["'][^"']*\bprompt-block\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+      if (!scene || !promptBlockMatch) continue;
+      const headText = htmlToPlainText(headMatch?.[1] || "");
+      const promptNumber = headText.match(/提示词\s*(\d+)/)?.[1] || String(shots.length + 1);
+      const video_prompt = htmlToPlainText(promptBlockMatch[1]);
+      if (!video_prompt) continue;
+      shots.push(normalizeShot({
+        shot_id: `分镜${episode}-${scene}-${promptNumber}`,
+        transition: "video_direct",
+        image_prompt: "",
+        video_prompt,
+        video_model: "seedance2.0fast",
+        duration: extractDurationFromPrompt(video_prompt),
+        size: extractAspectRatioFromPrompt(video_prompt),
+        tag_refs: extractTags(video_prompt),
+        platform: "",
+      }, shots[shots.length - 1]?.shot_id || "", preferredSeedancePlatform));
+    }
+  }
+  return shots;
+}
+
 async function runLovartJob(projectId, job, canvas) {
   const dir = projectDir(projectId);
   const outputDir = path.join(dir, job.kind === "image" ? "images" : "videos");
@@ -1154,7 +1480,8 @@ async function runLovartJob(projectId, job, canvas) {
     };
   }
   if (parsed.generation_succeeded === false) {
-    return { ok: false, reason: parsed.agent_message || parsed.warning || "Lovart 未生成文件。" };
+    const reason = parsed.agent_message || parsed.warning || "Lovart 未生成文件。";
+    return { ok: false, status: isLovartInteractionPrompt(reason) ? "needs_input" : "failed", reason };
   }
 
   const created = assetsFromLovartResult(projectId, job, parsed);
@@ -1240,7 +1567,7 @@ async function runJimengJob(projectId, job, canvas) {
       return { ok: false, reason: "即梦图生图当前只支持图片，先把视频和音频断开。" };
     }
     for (const item of imageInputs) {
-      const localPath = await ensureJimengLocalAsset(projectId, item.asset);
+      const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
         return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
       }
@@ -1267,8 +1594,9 @@ async function runJimengJob(projectId, job, canvas) {
     if (videoInputs.length || audioInputs.length) {
       return { ok: false, reason: "即梦单图生视频这轮只接一张首帧图片，视频和音频参考先别连进来。" };
     }
-    const imageAsset = (explicitFirstFrames[0] || imageInputs[0])?.asset || firstJimengImageInput(job, canvas);
-    const localImagePath = await ensureJimengLocalAsset(projectId, imageAsset);
+    const imageInput = explicitFirstFrames[0] || imageInputs[0] || null;
+    const imageAsset = imageInput?.asset || firstJimengImageInput(job, canvas);
+    const localImagePath = await ensureJimengLocalAsset(projectId, imageAsset, imageInput || {});
     if (!localImagePath || !fs.existsSync(localImagePath)) {
       return { ok: false, reason: "这张图片还没法给即梦使用。先检查 URL 是否还能访问，或改用本地图片。" };
     }
@@ -1287,21 +1615,21 @@ async function runJimengJob(projectId, job, canvas) {
       return { ok: false, reason: "即梦全能参考当前最多支持 3 个音频参考，请先减少一些。" };
     }
     for (const item of imageInputs) {
-      const localPath = await ensureJimengLocalAsset(projectId, item.asset);
+      const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
         return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
       }
       args.push("--image", localPath);
     }
     for (const item of videoInputs) {
-      const localPath = await ensureJimengLocalAsset(projectId, item.asset);
+      const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
         return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
       }
       args.push("--video", localPath);
     }
     for (const item of audioInputs) {
-      const localPath = await ensureJimengLocalAsset(projectId, item.asset);
+      const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
         return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
       }
@@ -1332,7 +1660,7 @@ async function runJimengJob(projectId, job, canvas) {
     return { ok: false, reason: "即梦提交成功了，但没有返回 submit_id。" };
   }
   if (genStatus && genStatus !== "querying" && genStatus !== "running") {
-    return { ok: false, reason: `即梦提交状态异常：${genStatus}` };
+    return { ok: false, reason: jimengFailureReason(parsed, `即梦提交状态异常：${genStatus}`) };
   }
   return {
     ok: false,
@@ -1354,8 +1682,8 @@ function assetsFromDreaminaResult(projectId, job, parsed) {
       const ext = path.extname(file);
       const kind = job.kind === "video" ? "video" : "image";
       const suffix = items.length > 1 ? `_${index + 1}` : "";
-      const desiredName = job.asset_template_label
-        ? safeName(`${String(job.asset_template_label).replace(/^@/, "")}${suffix}`)
+      const desiredName = (job.asset_template_id || job.asset_template_label || job.asset_template_filename)
+        ? assetTemplateOutputName(job, suffix)
         : (() => {
             const shotPart = job.shot_ids?.length ? `分镜${job.shot_ids.join("-")}` : path.basename(file, ext);
             const kindPart = kind === "video" ? "视频" : "图片";
@@ -1408,7 +1736,7 @@ async function refreshDreaminaJob(projectId, job) {
     return { ok: false, pending: true, status: "running", reason: "即梦仍在生成中。" };
   }
   if (genStatus !== "success") {
-    return { ok: false, reason: "即梦平台退回失败。" };
+    return { ok: false, reason: jimengFailureReason(parsed) };
   }
   const created = assetsFromDreaminaResult(projectId, job, parsed);
   if (!created.length) {
@@ -1431,10 +1759,10 @@ function assetsFromLovartResult(projectId, job, parsed) {
   return files.map((item, index) => {
     const file = item.local_path;
     const ext = path.extname(file);
-    const kind = ext.toLowerCase() === ".mp4" ? "video" : job.kind;
+    const kind = assetKindFromFile(file, job.kind || "image");
     const suffix = files.length > 1 ? `_${index + 1}` : "";
-    const desiredName = job.asset_template_label
-      ? safeName(`${String(job.asset_template_label).replace(/^@/, "")}${suffix}`)
+    const desiredName = (job.asset_template_id || job.asset_template_label || job.asset_template_filename)
+      ? assetTemplateOutputName(job, suffix)
       : (() => {
           const shotPart = job.shot_ids?.length
             ? `分镜${job.shot_ids.join("-")}`
@@ -1480,6 +1808,91 @@ function cleanGeneratedAssets(assets) {
   });
 }
 
+function generatedAssetFileForJob(projectId, job) {
+  const kind = job.kind === "video" ? "video" : "image";
+  const dir = path.join(projectDir(projectId), kind === "video" ? "videos" : "images");
+  if (!fs.existsSync(dir)) return "";
+  const base = assetTemplateOutputName(job);
+  const allowed = kind === "video"
+    ? [".mp4", ".mov", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".gif"]
+    : [".png", ".jpg", ".jpeg", ".webp", ".gif"];
+  const exact = allowed.map((ext) => path.join(dir, `${base}${ext}`)).find((file) => fs.existsSync(file));
+  if (exact) return exact;
+  const candidates = fs.readdirSync(dir)
+    .filter((name) => {
+      const ext = path.extname(name).toLowerCase();
+      return allowed.includes(ext) && (name === `${base}${ext}` || name.startsWith(`${base}_`));
+    })
+    .map((name) => path.join(dir, name))
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  return candidates[0] || "";
+}
+
+function assetFromDownloadedJob(projectId, job, assetId) {
+  const file = generatedAssetFileForJob(projectId, job);
+  if (!file) return null;
+  const ext = path.extname(file).toLowerCase();
+  const kind = assetKindFromFile(file, job.kind || "image");
+  return {
+    asset_id: assetId,
+    name: path.basename(file, path.extname(file)),
+    kind,
+    source: "generated",
+    file_path: file,
+    thumbnail_path: kind === "image" ? file : undefined,
+    url: publicAssetUrl(projectId, file),
+    is_library_asset: Boolean(job.asset_template_id),
+    asset_category: job.asset_category || undefined,
+    asset_template_id: job.asset_template_id || undefined,
+  };
+}
+
+function reconcileDownloadedJobAssets(projectId, data) {
+  if (!data?.canvas || !Array.isArray(data.jobs)) return false;
+  data.canvas.nodes = Array.isArray(data.canvas.nodes) ? data.canvas.nodes : [];
+  data.canvas.edges = Array.isArray(data.canvas.edges) ? data.canvas.edges : [];
+  data.canvas.assets = Array.isArray(data.canvas.assets) ? data.canvas.assets : [];
+  let changed = false;
+  const assetIds = new Set(data.canvas.assets.map((asset) => asset.asset_id).filter(Boolean));
+  for (const job of data.jobs) {
+    if (job.status !== "downloaded") continue;
+    const outputAssetIds = (job.output_asset_ids || []).filter(Boolean);
+    if (!outputAssetIds.length) continue;
+    const repairedAssets = [];
+    for (const assetId of outputAssetIds) {
+      let asset = data.canvas.assets.find((item) => item.asset_id === assetId);
+      let assetWasMissing = false;
+      if (!asset) {
+        asset = assetFromDownloadedJob(projectId, job, assetId);
+        if (!asset) continue;
+        data.canvas.assets.push(asset);
+        assetIds.add(asset.asset_id);
+        repairedAssets.push(asset);
+        assetWasMissing = true;
+        changed = true;
+      }
+      const hasNode = data.canvas.nodes.some((node) => node.data?.asset_id === asset.asset_id);
+      if (!hasNode && !assetWasMissing) repairedAssets.push(asset);
+    }
+    if (repairedAssets.length) {
+      const anchor = resultAnchorForJob(data.canvas, job);
+      const resultNodes = placeResultNodes(data.canvas, repairedAssets, anchor, job);
+      const existingNodeAssets = new Set(data.canvas.nodes.map((node) => node.data?.asset_id).filter(Boolean));
+      const newNodes = resultNodes.filter((node) => !existingNodeAssets.has(node.data?.asset_id));
+      if (newNodes.length) {
+        data.canvas.nodes.push(...newNodes);
+        connectImageResultsToShotVideo(data.canvas, job, newNodes);
+        changed = true;
+      }
+    }
+  }
+  if (changed) {
+    saveProjectPart(projectId, "canvas.json", data.canvas);
+    saveProjectPart(projectId, "jobs.json", data.jobs);
+  }
+  return changed;
+}
+
 function syncAssetLibraryTemplate(projectId, updater) {
   const file = path.join(projectDir(projectId), "asset_library.json");
   const library = readJson(file, defaultAssetLibrary());
@@ -1506,6 +1919,13 @@ function attachGeneratedAssetsToTemplate(projectId, job, assets) {
     template.status = "done";
     template.failure_reason = "";
   });
+}
+
+function assetTemplateOutputName(job, suffix = "") {
+  const raw = String(job.asset_template_filename || job.asset_template_label || "").trim().replace(/^@/, "");
+  const base = path.basename(raw || "asset");
+  const ext = path.extname(base);
+  return safeName(`${ext ? path.basename(base, ext) : base}${suffix}`);
 }
 
 function blockingJobs(jobs) {
@@ -1662,6 +2082,20 @@ async function ensureContinuousShotTailFrame(projectId, data, job) {
   return { ready: true, frameNodeId: frameNode.id };
 }
 
+function backgroundErrorMessage(error, fallback = "后台提交任务失败。") {
+  const message = String(error?.message || error || "").trim();
+  return message || fallback;
+}
+
+function saveBackgroundErrorLog(projectId, jobId, error) {
+  try {
+    const logDir = path.join(projectDir(projectId), "logs");
+    ensureDir(logDir);
+    const text = String(error?.stack || error?.message || error || "后台提交任务失败。");
+    fs.writeFileSync(path.join(logDir, `${jobId}_submit_error_${Date.now()}.log`), text);
+  } catch {}
+}
+
 async function resumeQueuedContinuousJobs(projectId) {
   const data = loadProject(projectId);
   const jobsToStart = [];
@@ -1696,7 +2130,8 @@ async function resumeQueuedContinuousJobs(projectId) {
       const storedJob = fresh.jobs.find((item) => item.job_id === jobId);
       if (!storedJob) return;
       storedJob.status = "failed";
-      storedJob.failure_reason = error.message || "后台提交任务失败。";
+      saveBackgroundErrorLog(projectId, jobId, error);
+      storedJob.failure_reason = backgroundErrorMessage(error);
       storedJob.updated_at = now();
       updateAssetLibraryAfterJob(projectId, storedJob, { status: "failed", failure_reason: storedJob.failure_reason || "" });
       saveProjectPart(projectId, "jobs.json", fresh.jobs);
@@ -1881,6 +2316,10 @@ async function refreshLovartJob(projectId, job, canvas) {
   }
   const created = assetsFromLovartResult(projectId, job, parsed);
   if (!created.length) {
+    if (parsed.generation_succeeded === false) {
+      const reason = parsed.agent_message || parsed.warning || "Lovart 未生成文件。";
+      return { ok: false, status: isLovartInteractionPrompt(reason) ? "needs_input" : "failed", reason };
+    }
     const hasItems = Array.isArray(parsed.items) && parsed.items.length > 0;
     return {
       ok: false,
@@ -1922,10 +2361,72 @@ async function confirmLovartJob(projectId, job) {
     return { ok: false, pending: true, status: parsed.final_status, reason: `Lovart 当前状态：${parsed.final_status}` };
   }
   if (parsed.generation_succeeded === false) {
-    return { ok: false, reason: parsed.agent_message || parsed.warning || "Lovart 未生成文件。" };
+    const reason = parsed.agent_message || parsed.warning || "Lovart 未生成文件。";
+    return { ok: false, status: isLovartInteractionPrompt(reason) ? "needs_input" : "failed", reason };
   }
   const created = assetsFromLovartResult(projectId, job, parsed);
   if (!created.length) return { ok: false, reason: "Lovart 确认完成，但没有下载到本地文件。" };
+  return { ok: true, assets: created };
+}
+
+async function replyLovartJob(projectId, job, message) {
+  const dir = projectDir(projectId);
+  const outputDir = path.join(dir, job.kind === "image" ? "images" : "videos");
+  ensureDir(outputDir);
+  if (!job.lovart_thread_id) return { ok: false, reason: "这个任务没有 Lovart thread_id，无法回复。" };
+  const replyText = String(message || "").trim();
+  if (!replyText) return { ok: false, reason: "先输入要回复 Lovart 的处理方式。" };
+  const env = lovartEnv();
+  const skillPath = lovartSkillPath();
+  const selectedModel = job.parameters?.model || "";
+  const toolArgs = selectedModel && selectedModel !== "agent-auto" ? ["--include-tools", selectedModel] : [];
+  const logFile = path.join(dir, "logs", `${job.job_id}_reply_${Date.now()}.log`);
+  const result = await runCommand(PYTHON, [
+    skillPath,
+    "chat",
+    ...(job.lovart_project_id ? ["--project-id", job.lovart_project_id] : []),
+    "--thread-id",
+    job.lovart_thread_id,
+    "--prompt",
+    replyText,
+    ...toolArgs,
+    "--json",
+    "--download",
+    "--output-dir",
+    outputDir,
+  ], logFile, env);
+  if (!result.ok) return { ok: false, reason: result.error || "Lovart 回复失败" };
+  let parsed;
+  try {
+    parsed = parseJsonFromOutput(result.stdout);
+  } catch {
+    return { ok: false, reason: `Lovart 返回无法解析：${result.stdout || result.stderr}` };
+  }
+  if (parsed.project_id) job.lovart_project_id = parsed.project_id;
+  if (parsed.thread_id) job.lovart_thread_id = parsed.thread_id;
+  if (parsed.final_status === "pending_confirmation") {
+    const cost = parsed.pending_confirmation?.estimated_cost || "未知";
+    return {
+      ok: false,
+      status: "pending_confirmation",
+      reason: `Lovart 需要确认高消耗任务，预计 ${cost} credits。可在任务记录里点击“确认并继续”。`,
+      pending_confirmation: parsed.pending_confirmation || {},
+    };
+  }
+  if (parsed.final_status === "timeout") {
+    return {
+      ok: false,
+      pending: true,
+      status: "running",
+      reason: "Lovart 已接收回复，仍在生成中。请稍后刷新结果。",
+    };
+  }
+  if (parsed.generation_succeeded === false) {
+    const reason = parsed.agent_message || parsed.warning || "Lovart 未生成文件。";
+    return { ok: false, status: isLovartInteractionPrompt(reason) ? "needs_input" : "failed", reason };
+  }
+  const created = assetsFromLovartResult(projectId, job, parsed);
+  if (!created.length) return { ok: false, status: "failed", reason: "Lovart 回复完成，但没有下载到本地文件。" };
   return { ok: true, assets: created };
 }
 
@@ -1946,7 +2447,7 @@ async function processLovartJobSubmission(projectId, jobId) {
   if (job.submitted_prompt) storedJob.submitted_prompt = job.submitted_prompt;
   if (job.submitted_command) storedJob.submitted_command = job.submitted_command;
   if (!result.ok) {
-    const status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.pending ? (result.status || "running") : "failed");
+    const status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.status || (result.pending ? "running" : "failed"));
     storedJob.status = status;
     storedJob.failure_reason = status === "running" ? "" : result.reason;
     if (result.pending_confirmation) storedJob.pending_confirmation = result.pending_confirmation;
@@ -1990,6 +2491,37 @@ function send(res, status, value, contentType = "application/json; charset=utf-8
   res.end(contentType.startsWith("application/json") ? JSON.stringify(value) : value);
 }
 
+function serveFile(req, res, file) {
+  const contentType = MIME[path.extname(file).toLowerCase()] || "application/octet-stream";
+  const stat = fs.statSync(file);
+  const range = req.headers.range;
+  if (range && contentType.startsWith("video/")) {
+    const match = range.match(/bytes=(\d*)-(\d*)/);
+    const start = match?.[1] ? Number(match[1]) : 0;
+    const end = match?.[2] ? Number(match[2]) : stat.size - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= stat.size) {
+      res.writeHead(416, {
+        "Content-Range": `bytes */${stat.size}`,
+        "Accept-Ranges": "bytes",
+      });
+      return res.end();
+    }
+    res.writeHead(206, {
+      "Content-Type": contentType,
+      "Content-Length": end - start + 1,
+      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+      "Accept-Ranges": "bytes",
+    });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+  res.writeHead(200, {
+    "Content-Type": contentType,
+    "Content-Length": stat.size,
+    "Accept-Ranges": contentType.startsWith("video/") ? "bytes" : "none",
+  });
+  return fs.createReadStream(file).pipe(res);
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
@@ -2000,13 +2532,13 @@ function serveStatic(req, res) {
     const projectPath = path.resolve(projectDir(projectId));
     const file = path.resolve(path.join(projectPath, rel));
     if (!file.startsWith(projectPath) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain; charset=utf-8");
-    return send(res, 200, fs.readFileSync(file), MIME[path.extname(file).toLowerCase()] || "application/octet-stream");
+    return serveFile(req, res, file);
   }
 
   const filePath = path.join(PUBLIC_DIR, url.pathname === "/" ? "index.html" : url.pathname);
   const file = path.normalize(filePath);
   if (!file.startsWith(PUBLIC_DIR) || !fs.existsSync(file)) return send(res, 404, "Not found", "text/plain; charset=utf-8");
-  send(res, 200, fs.readFileSync(file), MIME[path.extname(file).toLowerCase()] || "text/plain; charset=utf-8");
+  serveFile(req, res, file);
 }
 
 async function handleApi(req, res) {
@@ -2041,7 +2573,8 @@ async function handleApi(req, res) {
 
   if (req.method === "POST" && url.pathname === "/api/canvas/save") {
     const body = await readBody(req);
-    saveProjectPart(body.project_id, "canvas.json", body.canvas);
+    const nextCanvas = mergeCanvasForSave(body.project_id, body.canvas);
+    saveProjectPart(body.project_id, "canvas.json", nextCanvas);
     return send(res, 200, { ok: true });
   }
 
@@ -2050,6 +2583,15 @@ async function handleApi(req, res) {
     const buffer = Buffer.from(body.base64 || "", "base64");
     if (!buffer.length) return send(res, 400, { ok: false, error: "没有收到 Excel 文件。" });
     const shots = await parseShotsXlsx(buffer, body.project_id, body.seedance_platform || "lovart");
+    return send(res, 200, { shots });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/shots/parse-html") {
+    const body = await readBody(req);
+    const source = Buffer.from(body.base64 || "", "base64").toString("utf8");
+    if (!source.trim()) return send(res, 400, { ok: false, error: "没有收到 HTML 文件内容。" });
+    const shots = parseShotlistHtml(source, body.seedance_platform || "lovart");
+    if (!shots.length) return send(res, 400, { ok: false, error: "没有在这个网页里找到 Seedance 提示词块。" });
     return send(res, 200, { shots });
   }
 
@@ -2084,6 +2626,16 @@ async function handleApi(req, res) {
     if (!source.trim()) return send(res, 400, { ok: false, error: "没有收到资产 Markdown 内容。" });
     const current = loadProject(body.project_id).asset_library || defaultAssetLibrary();
     const assetLibrary = parseAssetLibraryMarkdown(source, current);
+    saveProjectPart(body.project_id, "asset_library.json", assetLibrary);
+    return send(res, 200, { asset_library: assetLibrary });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/asset-library/import-jsonl") {
+    const body = await readBody(req);
+    const source = Buffer.from(body.base64 || "", "base64").toString("utf8");
+    if (!source.trim()) return send(res, 400, { ok: false, error: "没有收到资产 JSONL 内容。" });
+    const current = loadProject(body.project_id).asset_library || defaultAssetLibrary();
+    const assetLibrary = parseAssetLibraryJsonl(source, current);
     saveProjectPart(body.project_id, "asset_library.json", assetLibrary);
     return send(res, 200, { asset_library: assetLibrary });
   }
@@ -2388,6 +2940,7 @@ async function handleApi(req, res) {
       parameters: generatorParameters(generatorData),
       asset_template_id: targetNode.data?.asset_template_id || undefined,
       asset_template_label: targetNode.data?.asset_template_label || undefined,
+      asset_template_filename: targetNode.data?.asset_template_filename || undefined,
       asset_category: targetNode.data?.asset_category || undefined,
       status: "running",
       failure_reason: undefined,
@@ -2412,7 +2965,8 @@ async function handleApi(req, res) {
         const storedJob = fresh.jobs.find((item) => item.job_id === job.job_id);
         if (!storedJob) return;
         storedJob.status = "failed";
-        storedJob.failure_reason = error.message || "后台提交任务失败。";
+        saveBackgroundErrorLog(body.project_id, job.job_id, error);
+        storedJob.failure_reason = backgroundErrorMessage(error);
         storedJob.updated_at = now();
         updateAssetLibraryAfterJob(body.project_id, storedJob, { status: "failed", failure_reason: storedJob.failure_reason || "" });
         saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
@@ -2436,7 +2990,7 @@ async function handleApi(req, res) {
     const fresh = loadProject(body.project_id);
     const storedJob = fresh.jobs.find((item) => item.job_id === body.job_id);
     if (!result.ok) {
-      storedJob.status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.pending ? (result.status || "running") : "failed");
+      storedJob.status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.status || (result.pending ? "running" : "failed"));
       storedJob.failure_reason = result.reason;
       storedJob.updated_at = now();
       updateAssetLibraryAfterJob(body.project_id, storedJob, { status: storedJob.status === "running" ? "running" : "failed", failure_reason: result.reason || "" });
@@ -2487,7 +3041,7 @@ async function handleApi(req, res) {
     const storedJob = fresh.jobs.find((item) => item.job_id === body.job_id);
     if (!result.ok) {
       if (result.pending) {
-        storedJob.status = result.status || "running";
+        storedJob.status = result.status === "pending_confirmation" ? "running" : (result.status || "running");
         storedJob.failure_reason = "已确认，Lovart 正在继续生成。";
         storedJob.pending_confirmation = undefined;
         storedJob.updated_at = now();
@@ -2495,7 +3049,7 @@ async function handleApi(req, res) {
         saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
         return send(res, 200, { ok: true, pending: true, job: storedJob, canvas: fresh.canvas, asset_library: loadProject(body.project_id).asset_library });
       }
-      storedJob.status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.pending ? (result.status || "running") : "failed");
+      storedJob.status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.status || (result.pending ? "running" : "failed"));
       storedJob.failure_reason = result.reason;
       storedJob.updated_at = now();
       updateAssetLibraryAfterJob(body.project_id, storedJob, { status: storedJob.status === "running" ? "running" : "failed", failure_reason: result.reason || "" });
@@ -2505,6 +3059,83 @@ async function handleApi(req, res) {
 
     recordProcessedDownloads(storedJob, result.assets);
     const cleanAssets = cleanGeneratedAssets(result.assets);
+    if (!cleanAssets.length) {
+      storedJob.status = "downloaded";
+      storedJob.failure_reason = undefined;
+      storedJob.pending_confirmation = undefined;
+      storedJob.updated_at = now();
+      saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
+      return send(res, 200, { ok: true, job: storedJob, assets: [], canvas: fresh.canvas, asset_library: loadProject(body.project_id).asset_library });
+    }
+    fresh.canvas.assets.push(...cleanAssets);
+    const anchor = resultAnchorForJob(fresh.canvas, storedJob);
+    const resultNodes = placeResultNodes(fresh.canvas, cleanAssets, anchor, storedJob);
+    fresh.canvas.nodes.push(...resultNodes);
+    connectImageResultsToShotVideo(fresh.canvas, storedJob, resultNodes);
+    storedJob.status = "downloaded";
+    storedJob.failure_reason = undefined;
+    storedJob.pending_confirmation = undefined;
+    storedJob.output_asset_ids = Array.from(new Set([...(storedJob.output_asset_ids || []), ...cleanAssets.map((asset) => asset.asset_id)]));
+    storedJob.updated_at = now();
+    attachGeneratedAssetsToTemplate(body.project_id, storedJob, cleanAssets);
+    saveProjectPart(body.project_id, "canvas.json", fresh.canvas);
+    saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
+    if (storedJob.kind === "video") {
+      void resumeQueuedContinuousJobs(body.project_id).catch(() => {});
+    }
+    return send(res, 200, { ok: true, job: storedJob, assets: cleanAssets, canvas: fresh.canvas, asset_library: loadProject(body.project_id).asset_library });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/jobs/reply") {
+    const body = await readBody(req);
+    const data = loadProject(body.project_id);
+    const job = data.jobs.find((item) => item.job_id === body.job_id);
+    if (!job) return send(res, 404, { ok: false, error: "找不到任务。" });
+    if (job.platform === "jimeng_cli") {
+      return send(res, 400, { ok: false, error: "即梦任务暂不需要回复平台交互。" });
+    }
+    if (job.status === "downloaded" && (job.output_asset_ids || []).length) {
+      return send(res, 200, { ok: true, job, assets: [], canvas: data.canvas, asset_library: data.asset_library });
+    }
+
+    const replyAt = now();
+    job.last_lovart_reply = String(body.message || "").trim();
+    job.last_lovart_reply_at = replyAt;
+    job.last_lovart_reply_status = "sending";
+    job.updated_at = replyAt;
+    saveProjectPart(body.project_id, "jobs.json", data.jobs);
+
+    const result = await replyLovartJob(body.project_id, job, body.message);
+    const fresh = loadProject(body.project_id);
+    const storedJob = fresh.jobs.find((item) => item.job_id === body.job_id);
+    storedJob.last_lovart_reply = String(body.message || "").trim();
+    storedJob.last_lovart_reply_at = replyAt;
+    if (job.lovart_project_id) storedJob.lovart_project_id = job.lovart_project_id;
+    if (job.lovart_thread_id) storedJob.lovart_thread_id = job.lovart_thread_id;
+    if (!result.ok) {
+      if (result.pending) {
+        storedJob.last_lovart_reply_status = "sent";
+        storedJob.status = result.status || "running";
+        storedJob.failure_reason = "";
+        storedJob.pending_confirmation = undefined;
+        storedJob.updated_at = now();
+        updateAssetLibraryAfterJob(body.project_id, storedJob, { status: "running", failure_reason: "" });
+        saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
+        return send(res, 200, { ok: true, pending: true, job: storedJob, canvas: fresh.canvas, asset_library: loadProject(body.project_id).asset_library });
+      }
+      storedJob.last_lovart_reply_status = "failed";
+      storedJob.status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.status || "failed");
+      storedJob.failure_reason = result.reason;
+      if (result.pending_confirmation) storedJob.pending_confirmation = result.pending_confirmation;
+      storedJob.updated_at = now();
+      updateAssetLibraryAfterJob(body.project_id, storedJob, { status: storedJob.status === "running" ? "running" : "failed", failure_reason: result.reason || "" });
+      saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
+      return send(res, 200, { ok: false, job: storedJob, error: result.reason });
+    }
+
+    recordProcessedDownloads(storedJob, result.assets);
+    const cleanAssets = cleanGeneratedAssets(result.assets);
+    storedJob.last_lovart_reply_status = "sent";
     if (!cleanAssets.length) {
       storedJob.status = "downloaded";
       storedJob.failure_reason = undefined;
@@ -2576,12 +3207,15 @@ if (require.main === module) {
 
 module.exports = {
   assetsFromLovartResult,
+  assetTemplateOutputName,
   buildTags,
   cleanGeneratedAssets,
   connectImageResultsToShotVideo,
   createProject,
   loadProject,
   placeResultNodes,
+  parseShotlistHtml,
+  parseAssetLibraryJsonl,
   parseShots,
   recordProcessedDownloads,
   safeName,

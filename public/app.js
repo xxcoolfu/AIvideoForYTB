@@ -13,6 +13,7 @@ const state = {
   selectedEdgeId: null,
   connectSourceId: null,
   connectSourceIds: [],
+  contextConnection: null,
   selectionMode: false,
   marquee: null,
   suppressCanvasClick: false,
@@ -20,6 +21,7 @@ const state = {
   settings: null,
   viewport: { x: 0, y: 0, scale: 1 },
   pan: null,
+  nodeDrag: null,
   contextPoint: null,
   previewVideoNodeId: null,
   pendingDeleteAssetId: null,
@@ -40,6 +42,18 @@ const state = {
   inspectorEditing: false,
   lastInspectorInputAt: 0,
   jobActionLocks: new Set(),
+  bulkSubmit: {
+    active: false,
+    processing: false,
+    queue: [],
+    currentJobId: null,
+    currentNodeId: null,
+    total: 0,
+    submitted: 0,
+    skipped: 0,
+    retryCounts: {},
+    retryTimer: null,
+  },
   availableProjects: [],
   rightTab: "inspector",
   leftPanelResize: null,
@@ -81,6 +95,12 @@ const JIMENG_IMAGE_MODELS = {
 };
 const SHOT_SEEDANCE_PLATFORM_KEY = "ai-video-seedance-platform";
 const LEFT_PANEL_WIDTH_KEY = "ai-video-left-panel-width";
+const LAST_PROJECT_KEY = "ai-video-last-project-id";
+const CANVAS_DRAFT_PREFIX = "ai-video-canvas-draft:";
+const CANVAS_MIN_SCALE = 0.1;
+const CANVAS_MAX_SCALE = 2.5;
+const CONTEXT_NODE_GAP = 90;
+const BULK_SUBMIT_LOVART_ACTIVE_LIMIT = 9;
 
 function workflowPreset(workflowId = DEFAULT_WORKFLOW_ID) {
   return WORKFLOW_PRESETS[workflowId] || WORKFLOW_PRESETS[DEFAULT_WORKFLOW_ID];
@@ -114,6 +134,126 @@ function setStatus(message, tone = "") {
   el.className = tone;
 }
 
+function canvasDraftKey(projectId = state.projectId) {
+  return `${CANVAS_DRAFT_PREFIX}${projectId}`;
+}
+
+function readCanvasDraft(projectId = state.projectId) {
+  try {
+    const raw = localStorage.getItem(canvasDraftKey(projectId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCanvasDraft(reason = "pending_sync", options = {}) {
+  if (!state.projectId || !state.canvas) return;
+  const draft = {
+    project_id: state.projectId,
+    saved_at: new Date().toISOString(),
+    reason,
+    canvas: state.canvas,
+  };
+  try {
+    localStorage.setItem(canvasDraftKey(state.projectId), JSON.stringify(draft));
+    if (options.showNotice || reason === "server_save_failed") {
+      renderCanvasDraftNotice(draft);
+    }
+  } catch (error) {
+    setStatus(`本地备份失败：${error.message}`, "bad");
+  }
+}
+
+function clearCanvasDraft(projectId = state.projectId) {
+  localStorage.removeItem(canvasDraftKey(projectId));
+  renderCanvasDraftNotice(null);
+}
+
+function formatDraftTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function mergeCanvasDraftWithServer(draftCanvas = {}, serverCanvas = {}) {
+  const next = JSON.parse(JSON.stringify({
+    nodes: Array.isArray(draftCanvas.nodes) ? draftCanvas.nodes : [],
+    edges: Array.isArray(draftCanvas.edges) ? draftCanvas.edges : [],
+    assets: Array.isArray(draftCanvas.assets) ? draftCanvas.assets : [],
+  }));
+  const nextAssetIds = new Set(next.assets.map((asset) => asset.asset_id).filter(Boolean));
+  const preservedAssets = (serverCanvas.assets || []).filter((asset) => {
+    if (!asset.asset_id || nextAssetIds.has(asset.asset_id)) return false;
+    return asset.source === "generated" || asset.source_job_id || asset.asset_template_id;
+  });
+  next.assets.push(...preservedAssets);
+  const preservedAssetIds = new Set(preservedAssets.map((asset) => asset.asset_id).filter(Boolean));
+  const nextNodeIds = new Set(next.nodes.map((node) => node.id).filter(Boolean));
+  const preservedNodes = (serverCanvas.nodes || []).filter((node) => {
+    if (!node.id || nextNodeIds.has(node.id)) return false;
+    return node.data?.source_job_id || preservedAssetIds.has(node.data?.asset_id);
+  });
+  next.nodes.push(...preservedNodes);
+  preservedNodes.forEach((node) => nextNodeIds.add(node.id));
+  const edgeKey = (edge) => `${edge.source || ""}->${edge.target || ""}`;
+  const nextEdgeKeys = new Set(next.edges.map(edgeKey));
+  for (const edge of serverCanvas.edges || []) {
+    if (!edge.source || !edge.target) continue;
+    if (!nextNodeIds.has(edge.source) || !nextNodeIds.has(edge.target)) continue;
+    const key = edgeKey(edge);
+    if (nextEdgeKeys.has(key)) continue;
+    next.edges.push(edge);
+    nextEdgeKeys.add(key);
+  }
+  return next;
+}
+
+function renderCanvasDraftNotice(draft = readCanvasDraft()) {
+  const notice = $("#canvasDraftNotice");
+  if (!notice) return;
+  if (!draft) {
+    notice.hidden = true;
+    return;
+  }
+  const text = $("#canvasDraftText");
+  if (text) {
+    text.textContent = `有一份未同步的本地画布备份${formatDraftTime(draft.saved_at) ? `（${formatDraftTime(draft.saved_at)}）` : ""}。`;
+  }
+  notice.hidden = false;
+}
+
+async function restoreCanvasDraft(options = {}) {
+  const draft = readCanvasDraft();
+  if (!draft?.canvas) {
+    renderCanvasDraftNotice(null);
+    return false;
+  }
+  state.canvas = mergeCanvasDraftWithServer(draft.canvas, state.canvas);
+  state.canvasDirty = true;
+  render();
+  renderCanvasDraftNotice(draft);
+  setStatus("已恢复本地备份，正在同步到项目...", "ok");
+  try {
+    await saveCanvas({ silent: true });
+    setStatus("本地备份已恢复并同步到项目。", "ok");
+  } catch (error) {
+    setStatus(`本地备份已恢复，但还没同步到项目：${error.message}`, "bad");
+  }
+  return true;
+}
+
+function fitTextareaToContent(textarea) {
+  if (!textarea || textarea.tagName !== "TEXTAREA") return;
+  textarea.style.height = "auto";
+  textarea.style.height = `${textarea.scrollHeight + 2}px`;
+}
+
+function fitShotPromptTextareas(root = document) {
+  root.querySelectorAll(".shot-prompt-textarea").forEach(fitTextareaToContent);
+}
+
 function leftPanelWidth() {
   const value = Number(localStorage.getItem(LEFT_PANEL_WIDTH_KEY) || "");
   if (Number.isFinite(value) && value >= 300 && value <= 560) return value;
@@ -124,6 +264,38 @@ function applyLeftPanelWidth(width) {
   const next = Math.max(300, Math.min(560, Math.round(width)));
   document.documentElement.style.setProperty("--left-panel-width", `${next}px`);
   localStorage.setItem(LEFT_PANEL_WIDTH_KEY, String(next));
+}
+
+function lastProjectId() {
+  return (localStorage.getItem(LAST_PROJECT_KEY) || "").trim();
+}
+
+function rememberLastProjectId(projectId) {
+  const next = String(projectId || "").trim();
+  if (next) localStorage.setItem(LAST_PROJECT_KEY, next);
+}
+
+async function initialProjectId() {
+  const rememberedProjectId = lastProjectId();
+  try {
+    const result = await api("/api/projects");
+    state.availableProjects = result.projects || [];
+    state.settings = { ...(state.settings || {}), project_root: result.project_root };
+    if (rememberedProjectId) {
+      const exists = state.availableProjects.some((project) => project.project_id === rememberedProjectId);
+      if (exists) return rememberedProjectId;
+      localStorage.removeItem(LAST_PROJECT_KEY);
+    }
+    const defaultProject = state.availableProjects.find((project) => project.project_id === state.projectId);
+    if (defaultProject) return defaultProject.project_id;
+    const recentProject = [...state.availableProjects].sort((a, b) => {
+      return new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime();
+    })[0];
+    if (recentProject) return recentProject.project_id;
+  } catch (error) {
+    if (rememberedProjectId) return rememberedProjectId;
+  }
+  return state.projectId;
 }
 
 function formatTimeLabel(value) {
@@ -154,6 +326,14 @@ function selectedNodes() {
   return state.canvas.nodes.filter((node) => ids.has(node.id));
 }
 
+function isGeneratorNode(node) {
+  return node && ["imageGen", "videoGen"].includes(node.type);
+}
+
+function selectedGeneratorNodes() {
+  return selectedNodes().filter(isGeneratorNode);
+}
+
 function isNodeSelected(nodeId) {
   return selectedNodeIds().includes(nodeId);
 }
@@ -163,6 +343,7 @@ function syncSelectionState() {
   state.selectedNodeIds = ids;
   if (ids.length) {
     if (!ids.includes(state.selectedNodeId)) state.selectedNodeId = ids[ids.length - 1];
+    state.rightTab = "inspector";
   } else {
     state.selectedNodeId = null;
   }
@@ -171,6 +352,7 @@ function syncSelectionState() {
 function setSingleNodeSelection(nodeId) {
   state.selectedNodeIds = nodeId ? [nodeId] : [];
   state.selectedNodeId = nodeId || null;
+  if (nodeId) state.rightTab = "inspector";
   state.pendingDeleteNodeId = null;
   state.pendingDeleteEdgeId = null;
   state.pendingForceSubmitNodeId = null;
@@ -322,6 +504,215 @@ function toggleSelectionMode(force) {
   state.selectionMode = typeof force === "boolean" ? force : !state.selectionMode;
   setStatus(state.selectionMode ? "框选多选已开启。拖动画布空白处即可框选。" : "框选多选已关闭。", "ok");
   render();
+}
+
+function startConnectFromSelection() {
+  const selected = selectedNodes();
+  if (!selected.length) {
+    setStatus("先选择一个作为输出的节点。");
+    return;
+  }
+  const sameTypeSelection = selected.length > 1 && selected.every((node) => node.type === selected[0].type);
+  const sourceIds = sameTypeSelection ? selected.map((node) => node.id) : [selectedNode()?.id].filter(Boolean);
+  setConnectSources(sourceIds);
+  state.selectedEdgeId = null;
+  setStatus(sourceIds.length > 1 ? `已选择 ${sourceIds.length} 个同类型输出节点。再点目标节点完成批量连线。` : `已选择输出：${nodeTitle(selectedNode())}。再点目标节点完成连线。`);
+  render();
+}
+
+function bulkSubmitStateText() {
+  const bulk = state.bulkSubmit;
+  const pending = bulk.queue.length;
+  const active = activeLovartJobCount();
+  if (!bulk.active) return "";
+  if (bulk.currentJobId) {
+    return `批量提交中：已投 ${bulk.submitted}/${bulk.total}，待投 ${pending}，Lovart 活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
+  }
+  return `批量队列：已投 ${bulk.submitted}/${bulk.total}，待投 ${pending}，Lovart 活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
+}
+
+function resetBulkSubmitQueue() {
+  if (state.bulkSubmit.retryTimer) {
+    clearTimeout(state.bulkSubmit.retryTimer);
+  }
+  state.bulkSubmit = {
+    active: false,
+    processing: false,
+    queue: [],
+    currentJobId: null,
+    currentNodeId: null,
+    total: 0,
+    submitted: 0,
+    skipped: 0,
+    retryCounts: {},
+    retryTimer: null,
+  };
+}
+
+function stopBulkSubmit(message, tone = "bad") {
+  const skippedText = state.bulkSubmit.skipped ? `，跳过 ${state.bulkSubmit.skipped} 条` : "";
+  const prefix = message || "批量提交已暂停。";
+  resetBulkSubmitQueue();
+  renderToolbarState();
+  setStatus(`${prefix}${skippedText}`, tone);
+}
+
+function activeLovartJobCount() {
+  return state.jobs.filter((job) => {
+    const platform = job.platform || "lovart";
+    if (platform !== "lovart") return false;
+    return ["running", "pending_confirmation"].includes(job.status);
+  }).length;
+}
+
+function rateLimitedJobs() {
+  return state.jobs.filter((job) => job.status === "rate_limited" && !job.rate_limit_handled);
+}
+
+function hasBulkCapacityForNode(node) {
+  const platform = normalizeGeneratorData(node?.data || {}).platform || "lovart";
+  if (platform !== "lovart") return true;
+  return activeLovartJobCount() < BULK_SUBMIT_LOVART_ACTIVE_LIMIT;
+}
+
+function scheduleBulkSubmitRetry(delay = 3000) {
+  if (!state.bulkSubmit.active) return;
+  if (state.bulkSubmit.retryTimer) clearTimeout(state.bulkSubmit.retryTimer);
+  state.bulkSubmit.retryTimer = setTimeout(() => {
+    state.bulkSubmit.retryTimer = null;
+    processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+  }, delay);
+}
+
+async function startBulkSubmitSelected() {
+  const nodes = selectedGeneratorNodes();
+  if (!nodes.length) {
+    setStatus("先选中要批量提交的图片/视频生成节点。", "bad");
+    return;
+  }
+  const existing = new Set([
+    ...state.bulkSubmit.queue,
+    state.bulkSubmit.currentNodeId,
+  ].filter(Boolean));
+  const nextIds = nodes.map((node) => node.id).filter((id) => !existing.has(id));
+  if (!nextIds.length) {
+    setStatus("这些节点已经在批量提交队列里了。", "bad");
+    return;
+  }
+  if (!state.bulkSubmit.active) {
+    resetBulkSubmitQueue();
+    state.bulkSubmit.active = true;
+  }
+  state.bulkSubmit.queue.push(...nextIds);
+  state.bulkSubmit.total += nextIds.length;
+  renderToolbarState();
+  setStatus(`已加入 ${nextIds.length} 个生成节点。${bulkSubmitStateText()}`, "ok");
+  try {
+    await saveCanvas({ silent: true });
+  } catch (error) {
+    resetBulkSubmitQueue();
+    renderToolbarState();
+    setStatus(`批量提交没有开始：本地服务连接失败或保存失败。${error.message}`, "bad");
+    return;
+  }
+  processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+}
+
+async function refreshBulkSubmitState() {
+  const fresh = await api(`/api/project?project_id=${encodeURIComponent(state.projectId)}`);
+  state.jobs = fresh.jobs;
+  state.canvas = fresh.canvas;
+  state.project = fresh.project;
+  state.assetLibrary = fresh.asset_library || state.assetLibrary;
+}
+
+async function markRateLimitedJobsHandledSilently(jobs) {
+  for (const job of jobs) {
+    await api("/api/jobs/mark-handled", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, job_id: job.job_id }),
+    });
+  }
+  await refreshBulkSubmitState();
+}
+
+async function submitBulkNode(nodeId) {
+  const result = await api("/api/jobs/submit", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, node_id: nodeId, force_duplicate: false }),
+  });
+  await refreshBulkSubmitState();
+  if (result.ok) {
+    if (result.job) upsertJob(result.job);
+    state.bulkSubmit.submitted += 1;
+    scheduleAutoRefresh();
+    return { ok: true, job: result.job };
+  }
+  if (result.duplicate_pending) {
+    state.bulkSubmit.skipped += 1;
+    return { ok: false, skipped: true, reason: "已有进行中的任务" };
+  }
+  if (result.blocked) {
+    return { ok: false, blocked: true, reason: result.error || "并发限制任务未处理" };
+  }
+  throw new Error(result.error || "批量提交失败。");
+}
+
+async function processBulkSubmitQueue() {
+  const bulk = state.bulkSubmit;
+  if (!bulk.active || bulk.processing) return;
+  bulk.processing = true;
+  let submittedThisPass = 0;
+  try {
+    await refreshBulkSubmitState();
+    if (rateLimitedJobs().length) {
+      if (activeLovartJobCount() >= BULK_SUBMIT_LOVART_ACTIVE_LIMIT || runningJobsForAutoRefresh().length) {
+        setStatus(`批量提交暂停：Lovart 活跃任务较多，等返图后自动继续。${bulkSubmitStateText()}`, "ok");
+        scheduleAutoRefresh();
+        scheduleBulkSubmitRetry(12000);
+        return;
+      }
+      await markRateLimitedJobsHandledSilently(rateLimitedJobs());
+    }
+    while (bulk.queue.length) {
+      const nodeId = bulk.queue[0];
+      const node = state.canvas.nodes.find((item) => item.id === nodeId);
+      if (!node || !isGeneratorNode(node)) {
+        bulk.queue.shift();
+        bulk.skipped += 1;
+        continue;
+      }
+      if (!hasBulkCapacityForNode(node)) {
+        setStatus(`Lovart 已有 ${activeLovartJobCount()} 条活跃任务，批量提交先等返图。${bulkSubmitStateText()}`, "ok");
+        scheduleAutoRefresh();
+        scheduleBulkSubmitRetry(12000);
+        return;
+      }
+      bulk.currentNodeId = nodeId;
+      setStatus(`正在批量提交：${nodeTitle(node)}。${bulkSubmitStateText()}`, "ok");
+      const result = await submitBulkNode(nodeId);
+      bulk.queue.shift();
+      bulk.currentNodeId = null;
+      bulk.currentJobId = result.job?.job_id || null;
+      if (result.blocked) {
+        bulk.queue.unshift(nodeId);
+        setStatus(`批量提交遇到并发限制，等返图后自动重试。${bulkSubmitStateText()}`, "ok");
+        scheduleAutoRefresh();
+        scheduleBulkSubmitRetry(12000);
+        return;
+      }
+      submittedThisPass += result.ok ? 1 : 0;
+    }
+    const skippedText = bulk.skipped ? `，跳过 ${bulk.skipped} 条已有任务的节点` : "";
+    const submittedText = bulk.submitted ? `已提交 ${bulk.submitted} 条` : "没有提交新任务";
+    resetBulkSubmitQueue();
+    render();
+    setStatus(`批量提交完成：${submittedText}${skippedText}。`, "ok");
+  } finally {
+    bulk.processing = false;
+    renderToolbarState();
+    if (submittedThisPass) render();
+  }
 }
 
 function alignSelectedNodes(axis) {
@@ -504,11 +895,11 @@ function renderAssociatedNodeSummary(node) {
       <div class="hint">类型：${escapeHtml(node.type === "imageGen" ? "图片生成" : "视频生成")}</div>
       <div class="hint">平台：${escapeHtml(platformLabel(node.data?.platform))}</div>
       <div class="hint">参数：${escapeHtml(formatGeneratorParameters(parameters) || "未设置")}</div>
-      <label class="field compact">
+      <label class="field compact generator-field-third">
         <span>完整参数</span>
         <textarea class="review-detail-text" readonly>${escapeHtml(fullParameters || "未设置")}</textarea>
       </label>
-      <label class="field compact">
+      <label class="field compact generator-field-third">
         <span>完整提示词</span>
         <textarea class="review-detail-text" readonly>${escapeHtml(prompt || "无")}</textarea>
       </label>
@@ -524,7 +915,7 @@ function renderAssociatedNodeSummary(node) {
   return `<div class="hint">${escapeHtml(nodeTitle(node))}</div>`;
 }
 
-function addNode(type, data = {}, position = null) {
+function addNode(type, data = {}, position = null, options = {}) {
   const index = state.canvas.nodes.length;
   const point = position || screenToWorld(
     canvasEl.getBoundingClientRect().left + canvasEl.clientWidth / 2 + (index % 3) * 24,
@@ -539,7 +930,10 @@ function addNode(type, data = {}, position = null) {
   };
   state.canvas.nodes.push(node);
   setSingleNodeSelection(node.id);
-  render();
+  state.canvasDirty = true;
+  scheduleCanvasSave();
+  if (options.render !== false) render();
+  return node;
 }
 
 function defaultNodeData(type) {
@@ -571,7 +965,18 @@ function assetById(assetId) {
 }
 
 function tagsFromText(text) {
-  return Array.from(new Set((String(text || "").match(/@(?:[A-Za-z][A-Za-z0-9_\-·]*|[\p{Script=Han}\p{N}_\-·]+)/gu) || []).map((x) => x.trim())));
+  const source = String(text || "");
+  const refs = new Set();
+  for (const match of source.matchAll(/^\s*@([^@\n]{1,120}?)\s+[—–-]\s+/gmu)) {
+    const label = String(match[1] || "").replace(/\s+/g, " ").trim();
+    if (label) refs.add(`@${label}`);
+  }
+  for (const token of source.match(/@(?:[A-Za-z][A-Za-z0-9_\-·]*|[\p{Script=Han}\p{N}_\-·]+)/gu) || []) {
+    const label = token.trim();
+    const isShortPrefix = Array.from(refs).some((fullLabel) => fullLabel !== label && fullLabel.startsWith(`${label} `));
+    if (!isShortPrefix) refs.add(label);
+  }
+  return Array.from(refs);
 }
 
 function escapeRegex(text) {
@@ -619,8 +1024,16 @@ function setPreferredSeedancePlatform(value) {
 }
 
 function extractDurationFromPrompt(text) {
-  const match = String(text || "").match(/\[\s*总时长\s*[：:]\s*(\d+)\s*秒\s*\]/);
-  return match?.[1] ? `${match[1]}s` : "";
+  const source = String(text || "");
+  const explicit = source.match(/\[\s*总时长\s*[：:]\s*(\d+)\s*秒\s*\]/);
+  if (explicit?.[1]) return `${explicit[1]}s`;
+  const compact = source.match(/(?:^|\n)\s*(\d+)\s*秒\s*[。.\s]*(?:\d+\s*:\s*\d+)?\s*[。.\s]*$/);
+  return compact?.[1] ? `${compact[1]}s` : "";
+}
+
+function extractAspectRatioFromPrompt(text) {
+  const match = String(text || "").match(/(?:^|\n|。|\s)(\d+\s*:\s*\d+)\s*[。.\s]*$/);
+  return match?.[1] ? match[1].replace(/\s+/g, "") : "";
 }
 
 function isKlingModelName(value) {
@@ -694,6 +1107,7 @@ function applySeedancePlatformToImportedShots(shots = [], preferredSeedancePlatf
       platform: normalized.platform,
       video_model: normalized.video_model,
       duration: String(shot.duration || extractDurationFromPrompt(shot.video_prompt || "") || "").trim(),
+      size: String(shot.size || extractAspectRatioFromPrompt(shot.video_prompt || "") || "").trim(),
     };
   });
 }
@@ -818,7 +1232,7 @@ function defaultVideoParameters(shot) {
       platform,
       model,
       duration,
-      size: wantsFirstFrame ? "" : "16:9",
+      size: wantsFirstFrame ? "" : (shot.size || "16:9"),
       mode: recommended.mode || (wantsFirstFrame ? "image2video" : "text2video"),
       video_resolution: "720p",
     };
@@ -829,6 +1243,7 @@ function defaultVideoParameters(shot) {
     platform,
     model,
     duration,
+    size: shot.size || "",
     feature: recommended.feature || (wantsFirstFrame ? "first_frame" : "text_to_video"),
   };
 }
@@ -1068,6 +1483,24 @@ function saveLeftSectionState(map) {
   localStorage.setItem(LEFT_SECTION_KEY, JSON.stringify(map));
 }
 
+function leftSections() {
+  return Array.from(document.querySelectorAll(".left-section[data-section-id]"));
+}
+
+function setLeftSectionExpanded(section, expanded) {
+  section.classList.toggle("collapsed", !expanded);
+  const toggle = section.querySelector(".section-toggle");
+  if (toggle) toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+}
+
+function saveCurrentLeftSectionState() {
+  const next = {};
+  leftSections().forEach((section) => {
+    next[section.dataset.sectionId] = !section.classList.contains("collapsed");
+  });
+  saveLeftSectionState(next);
+}
+
 function markInspectorInteraction() {
   state.lastInspectorInputAt = Date.now();
 }
@@ -1083,27 +1516,29 @@ function inspectorRecentlyActive(windowMs = 1500) {
 
 function applyLeftSectionState() {
   const stored = loadLeftSectionState();
-  document.querySelectorAll(".left-section[data-section-id]").forEach((section) => {
-    const sectionId = section.dataset.sectionId;
-    const expanded = Object.prototype.hasOwnProperty.call(stored, sectionId)
-      ? Boolean(stored[sectionId])
-      : sectionId === "shot-table";
-    section.classList.toggle("collapsed", !expanded);
-    const toggle = section.querySelector(".section-toggle");
-    if (toggle) toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  const sections = leftSections();
+  const hasStoredState = Object.keys(stored).length > 0;
+  const expandedSectionId = hasStoredState
+    ? sections.find((section) => Boolean(stored[section.dataset.sectionId]))?.dataset.sectionId
+    : "shot-table";
+  sections.forEach((section) => {
+    setLeftSectionExpanded(section, section.dataset.sectionId === expandedSectionId);
   });
+  saveCurrentLeftSectionState();
 }
 
 function toggleLeftSection(sectionId) {
   const section = document.querySelector(`.left-section[data-section-id="${sectionId}"]`);
   if (!section) return;
   const nextExpanded = section.classList.contains("collapsed");
-  section.classList.toggle("collapsed", !nextExpanded);
-  const toggle = section.querySelector(".section-toggle");
-  if (toggle) toggle.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
-  const stored = loadLeftSectionState();
-  stored[sectionId] = nextExpanded;
-  saveLeftSectionState(stored);
+  if (nextExpanded) {
+    leftSections().forEach((item) => {
+      setLeftSectionExpanded(item, item.dataset.sectionId === sectionId);
+    });
+  } else {
+    setLeftSectionExpanded(section, false);
+  }
+  saveCurrentLeftSectionState();
   if (sectionId === "assets") renderAssets();
 }
 
@@ -1423,6 +1858,7 @@ function upsertAssetTemplateNode(template, position) {
     },
     asset_template_id: template.template_id,
     asset_template_label: template.label,
+    asset_template_filename: template.filename || "",
     asset_category: template.category,
     is_asset_generation: true,
     template_status: template.status,
@@ -1684,9 +2120,12 @@ function openVideoPreview(nodeId) {
   state.previewVideoNodeId = nodeId;
   $("#videoPreviewTitle").textContent = asset.name;
   const player = $("#videoPreviewPlayer");
+  player.pause();
   player.src = asset.url;
-  player.currentTime = 0;
+  player.load();
   $("#videoPreviewModal").hidden = false;
+  player.onloadedmetadata = () => setStatus("视频预览已加载。", "ok");
+  player.onerror = () => setStatus("视频预览加载失败。文件在本地，但播放器没能读取这个视频。", "bad");
 }
 
 function closeVideoPreview() {
@@ -1769,7 +2208,19 @@ function renderNode(node) {
   } else if (asset?.kind === "image" && asset.url) {
     body = `<img src="${asset.url}" alt="${escapeHtml(asset.name)}">`;
   } else if (asset?.kind === "video" && asset.url) {
-    body = `<video src="${asset.url}" controls></video>`;
+    const videoName = escapeHtml(asset.name || "视频素材");
+    body = `
+      <div class="node-video-card">
+        <button type="button" class="node-video-surface" data-preview-node="${node.id}" aria-label="预览视频">
+          <span class="node-video-format">MP4</span>
+          <span class="node-video-play" aria-hidden="true"></span>
+        </button>
+        <div class="node-video-footer">
+          <div class="node-video-name" title="${videoName}">${videoName}</div>
+          <button type="button" data-preview-node="${node.id}">预览</button>
+        </div>
+      </div>
+    `;
   } else if (node.type === "imageGen" || node.type === "videoGen") {
     const shot = node.data.asset_template_label
       ? `资产 ${node.data.asset_template_label}`
@@ -1813,6 +2264,7 @@ function renderNode(node) {
   el.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".handle")) return;
     if (["BUTTON", "INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+    if (event.button !== 0) return;
     if (activeConnectSourceIds().length && !activeConnectSourceIds().includes(node.id)) {
       event.stopPropagation();
       hideContextMenu();
@@ -1830,7 +2282,25 @@ function renderNode(node) {
     state.selectedEdgeId = null;
     startDrag(event, node);
   });
-  el.querySelector(".handle.out").addEventListener("click", (event) => {
+  const inputHandle = el.querySelector(".handle.in");
+  const outputHandle = el.querySelector(".handle.out");
+  const openPortMenu = (event, port) => {
+    event.preventDefault();
+    event.stopPropagation();
+    state.selectionMode = false;
+    state.marquee = null;
+    renderToolbarState();
+    openCanvasContextMenu(event.clientX, event.clientY, nodePortInsertPosition(node, port), { nodeId: node.id, port });
+  };
+  inputHandle.addEventListener("contextmenu", (event) => openPortMenu(event, "in"));
+  outputHandle.addEventListener("contextmenu", (event) => openPortMenu(event, "out"));
+  el.querySelectorAll("[data-preview-node]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openVideoPreview(event.currentTarget.dataset.previewNode);
+    });
+  });
+  outputHandle.addEventListener("click", (event) => {
     event.stopPropagation();
     hideContextMenu();
     const selected = selectedNodes();
@@ -1846,13 +2316,16 @@ function renderNode(node) {
 
 function startDrag(event, node) {
   event.preventDefault();
+  state.nodeDrag = { nodeId: node.id };
   const startX = event.clientX;
   const startY = event.clientY;
   const dragNodes = isNodeSelected(node.id) ? selectedNodes() : [node];
   const origins = dragNodes.map((item) => ({ id: item.id, x: item.x, y: item.y }));
+  let moved = false;
   const move = (moveEvent) => {
     const deltaX = (moveEvent.clientX - startX) / state.viewport.scale;
     const deltaY = (moveEvent.clientY - startY) / state.viewport.scale;
+    moved = moved || Math.abs(moveEvent.clientX - startX) > 2 || Math.abs(moveEvent.clientY - startY) > 2;
     for (const origin of origins) {
       const target = state.canvas.nodes.find((item) => item.id === origin.id);
       if (!target) continue;
@@ -1864,7 +2337,13 @@ function startDrag(event, node) {
   const up = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", up);
+    state.nodeDrag = null;
+    if (moved) {
+      state.canvasDirty = true;
+      scheduleCanvasSave();
+    }
     render();
+    scheduleAutoRefresh();
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
@@ -1878,10 +2357,68 @@ function screenToWorld(clientX, clientY) {
   };
 }
 
+function worldToScreen(x, y) {
+  const rect = canvasEl.getBoundingClientRect();
+  return {
+    x: rect.left + state.viewport.x + x * state.viewport.scale,
+    y: rect.top + state.viewport.y + y * state.viewport.scale,
+  };
+}
+
+function findPortAtScreen(clientX, clientY) {
+  const tolerance = 18;
+  let best = null;
+  for (const node of state.canvas.nodes) {
+    const ports = [
+      { port: "in", ...worldToScreen(node.x, node.y + NODE_PORT_Y) },
+      { port: "out", ...worldToScreen(node.x + NODE_WIDTH, node.y + NODE_PORT_Y) },
+    ];
+    for (const candidate of ports) {
+      const distance = Math.hypot(candidate.x - clientX, candidate.y - clientY);
+      if (distance <= tolerance && (!best || distance < best.distance)) {
+        best = { node, port: candidate.port, distance };
+      }
+    }
+  }
+  return best;
+}
+
+function nodePortInsertPosition(node, port) {
+  return {
+    x: port === "in" ? node.x - NODE_WIDTH - CONTEXT_NODE_GAP : node.x + NODE_WIDTH + CONTEXT_NODE_GAP,
+    y: node.y,
+  };
+}
+
+function openCanvasContextMenu(clientX, clientY, worldPoint, connection = null) {
+  state.contextPoint = worldPoint;
+  state.contextConnection = connection;
+  const menu = $("#contextMenu");
+  menu.style.left = `${clientX}px`;
+  menu.style.top = `${clientY}px`;
+  menu.hidden = false;
+}
+
+function addNodeFromContext(type) {
+  const connection = state.contextConnection;
+  const position = state.contextPoint || screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
+  const node = addNode(type, defaultNodeData(type), position, { render: false });
+  if (connection) {
+    if (connection.port === "out") upsertEdge(connection.nodeId, node.id);
+    if (connection.port === "in") upsertEdge(node.id, connection.nodeId);
+    state.selectedEdgeId = null;
+    clearConnectSources();
+  }
+  hideContextMenu();
+  setStatus(connection ? "节点已添加并自动连线。" : "节点已添加。", "ok");
+  render();
+  saveCanvas({ silent: true }).catch((error) => setStatus(`节点已添加，但保存失败：${error.message}`, "bad"));
+}
+
 function zoomAt(clientX, clientY, direction) {
   const rect = canvasEl.getBoundingClientRect();
   const before = screenToWorld(clientX, clientY);
-  const nextScale = Math.min(2.5, Math.max(0.25, state.viewport.scale * (direction > 0 ? 0.9 : 1.1)));
+  const nextScale = Math.min(CANVAS_MAX_SCALE, Math.max(CANVAS_MIN_SCALE, state.viewport.scale * (direction > 0 ? 0.9 : 1.1)));
   state.viewport.scale = nextScale;
   state.viewport.x = clientX - rect.left - before.x * nextScale;
   state.viewport.y = clientY - rect.top - before.y * nextScale;
@@ -1907,16 +2444,16 @@ function applyViewportToBounds(bounds, options = {}) {
   state.viewport.y = (rect.height - height * scale) / 2 - minY * scale;
 }
 
-function fitToNodes() {
+function fitToNodes(options = {}) {
   if (!state.canvas.nodes.length) {
     state.viewport = { x: 0, y: 0, scale: 1 };
     render();
-    setStatus("画布已重置。");
+    if (!options.silent) setStatus("画布已重置。");
     return;
   }
   applyViewportToBounds(renderedNodeBounds() || canvasNodeBounds());
   render();
-  setStatus(`已适配全部节点，缩放 ${Math.round(state.viewport.scale * 100)}%`);
+  if (!options.silent) setStatus(`已适配全部节点，缩放 ${Math.round(state.viewport.scale * 100)}%`);
 }
 
 function resetView() {
@@ -1931,9 +2468,22 @@ function resetView() {
   setStatus("视图已回到默认查看位置。");
 }
 
+function beginCanvasPan(event) {
+  event.preventDefault();
+  state.pan = {
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: state.viewport.x,
+    originY: state.viewport.y,
+    moved: false,
+  };
+}
+
 function hideContextMenu() {
   const menu = $("#contextMenu");
   if (menu) menu.hidden = true;
+  state.contextConnection = null;
+  state.contextPoint = null;
 }
 
 function renderCanvasOnly() {
@@ -1961,6 +2511,7 @@ function renderToolbarState() {
   const toggle = $("#toggleMarqueeMode");
   if (toggle) toggle.classList.toggle("active", state.selectionMode);
   const selectedCount = selectedNodeIds().length;
+  const selectedGeneratorCount = selectedGeneratorNodes().length;
   ["#alignLeft", "#alignTop"].forEach((selector) => {
     const button = $(selector);
     if (button) button.disabled = selectedCount < 2;
@@ -1969,6 +2520,26 @@ function renderToolbarState() {
     const button = $(selector);
     if (button) button.disabled = selectedCount < 3;
   });
+  const bulkButton = $("#bulkSubmitSelected");
+  if (bulkButton) {
+    bulkButton.disabled = !selectedGeneratorCount || state.bulkSubmit.processing;
+    bulkButton.classList.toggle("active", state.bulkSubmit.active);
+    bulkButton.textContent = state.bulkSubmit.active
+      ? `批量队列 ${state.bulkSubmit.queue.length}`
+      : selectedGeneratorCount > 1
+        ? `批量提交 ${selectedGeneratorCount}`
+        : "批量提交";
+  }
+  const bulkStatus = $("#bulkSubmitStatus");
+  if (bulkStatus) {
+    if (state.bulkSubmit.active) {
+      bulkStatus.textContent = bulkSubmitStateText();
+    } else if (selectedGeneratorCount) {
+      bulkStatus.textContent = `已选 ${selectedGeneratorCount} 个生成节点`;
+    } else {
+      bulkStatus.textContent = activeLovartJobCount() ? `Lovart 活跃 ${activeLovartJobCount()}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}` : "";
+    }
+  }
 }
 
 function renderTags() {
@@ -2297,6 +2868,8 @@ function renderAssetLibrary() {
             <div class="asset-library-meta">
               <span>${escapeHtml(template.category)}</span>
               <span>${escapeHtml(template.default_size)}</span>
+              ${template.filename ? `<span>${escapeHtml(template.filename)}</span>` : ""}
+              ${template.source_file ? `<span>${escapeHtml(template.source_file)}</span>` : ""}
               <span>${escapeHtml(template.status || "idle")}</span>
             </div>
           </div>
@@ -2356,9 +2929,16 @@ function latestShotJob(shotId, kind) {
 
 function statusInfoFromJob(job) {
   if (!job) return null;
+  if (job.last_lovart_reply_status === "sending") {
+    return { label: "回复中", tone: "running", job };
+  }
+  if (job.status === "running" && job.last_lovart_reply) {
+    return { label: "已回复·生成中", tone: "running", job };
+  }
   const map = {
     queued: ["等待", "waiting"],
     running: ["生成中", "running"],
+    needs_input: ["待回复", "blocked"],
     pending_confirmation: ["待确认", "blocked"],
     rate_limited: ["并发限制", "blocked"],
     failed: ["失败", "failed"],
@@ -2368,6 +2948,39 @@ function statusInfoFromJob(job) {
   };
   const [label, tone] = map[job.status] || [job.status || "未知", "waiting"];
   return { label, tone, job };
+}
+
+function jobNeedsLovartReply(job) {
+  if (!job || job.platform === "jimeng_cli" || !job.lovart_thread_id) return false;
+  if (job.status === "needs_input") return true;
+  return job.status === "failed" && /你希望如何处理|请选择|请确认|确认此|确认.*生成|是否开始|是否|要继续|继续生成|如何处理|\?|？/i.test(String(job.failure_reason || ""));
+}
+
+function jobLooksLikePlanConfirmation(job) {
+  return /请确认|确认此|确认.*生成|是否开始/.test(String(job?.failure_reason || ""));
+}
+
+function formatJobReplyTime(job) {
+  if (!job?.last_lovart_reply_at) return "";
+  const date = new Date(job.last_lovart_reply_at);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function jobReplyNote(job) {
+  if (!job?.last_lovart_reply) return null;
+  const time = formatJobReplyTime(job);
+  const suffix = `${time ? `${time} · ` : ""}${job.last_lovart_reply}`;
+  if (job.last_lovart_reply_status === "sending") {
+    return { text: `正在发送给 Lovart：${suffix}`, tone: "pending" };
+  }
+  if (job.last_lovart_reply_status === "failed") {
+    return { text: `回复发送失败：${suffix}`, tone: "bad" };
+  }
+  if (job.status === "running") {
+    return { text: `已发出回复，等待 Lovart 返回：${suffix}`, tone: "pending" };
+  }
+  return { text: `已回复 Lovart：${suffix}`, tone: "ok" };
 }
 
 function shotPartStatus(shot, kind) {
@@ -2440,31 +3053,33 @@ function renderShotTable() {
         <span>模型：${escapeHtml(shotModelLabel(shot.video_model))}</span>
         ${shot.duration ? `<span>时长：${escapeHtml(shot.duration)}</span>` : ""}
       </div>
-      <div class="hint">${escapeHtml((shot.video_prompt || shot.image_prompt || "").slice(0, 60))}</div>
-      <div class="shot-inline-fields shot-inline-fields-wide">
-      <label class="field"><span>分镜号</span><input data-shot-index="${index}" data-shot-field="shot_id" value="${escapeHtml(shot.shot_id)}"></label>
-      <label class="field"><span>衔接方式</span>
-        <select data-shot-index="${index}" data-shot-field="transition">
-          <option value="new_frame" ${shot.transition === "new_frame" ? "selected" : ""}>新建首帧</option>
-          <option value="continue_prev_tail" ${shot.transition === "continue_prev_tail" ? "selected" : ""}>接上一尾帧</option>
-          <option value="video_direct" ${shot.transition === "video_direct" ? "selected" : ""}>视频直出</option>
-        </select>
-      </label>
-      <label class="field"><span>平台</span>
-        <select data-shot-index="${index}" data-shot-field="platform">
-          ${GENERATION_PLATFORMS.map((platform) => `<option value="${platform.value}" ${normalizePlatform(shot.platform) === platform.value ? "selected" : ""}>${escapeHtml(platform.label)}</option>`).join("")}
-        </select>
-      </label>
-      <label class="field"><span>视频模型</span>
-        <select data-shot-index="${index}" data-shot-field="video_model">
-          <option value="" ${!shot.video_model ? "selected" : ""}>自动</option>
-          ${availableVideoModels.map((model) => `<option value="${escapeHtml(model)}" ${shot.video_model === model ? "selected" : ""}>${escapeHtml(shotModelLabel(model))}</option>`).join("")}
-        </select>
-      </label>
-      <label class="field"><span>时长</span><input data-shot-index="${index}" data-shot-field="duration" value="${escapeHtml(shot.duration || "")}" placeholder="例如 10s"></label>
-      </div>
-      <label class="field"><span>图片提示词</span><textarea data-shot-index="${index}" data-shot-field="image_prompt">${escapeHtml(shot.image_prompt || "")}</textarea></label>
-      <label class="field"><span>视频提示词</span><textarea data-shot-index="${index}" data-shot-field="video_prompt">${escapeHtml(shot.video_prompt || "")}</textarea></label>
+      <details class="shot-params">
+        <summary>修改分镜参数</summary>
+        <div class="shot-inline-fields shot-inline-fields-wide">
+        <label class="field"><span>分镜号</span><input data-shot-index="${index}" data-shot-field="shot_id" value="${escapeHtml(shot.shot_id)}"></label>
+        <label class="field"><span>衔接方式</span>
+          <select data-shot-index="${index}" data-shot-field="transition">
+            <option value="new_frame" ${shot.transition === "new_frame" ? "selected" : ""}>新建首帧</option>
+            <option value="continue_prev_tail" ${shot.transition === "continue_prev_tail" ? "selected" : ""}>接上一尾帧</option>
+            <option value="video_direct" ${shot.transition === "video_direct" ? "selected" : ""}>视频直出</option>
+          </select>
+        </label>
+        <label class="field"><span>平台</span>
+          <select data-shot-index="${index}" data-shot-field="platform">
+            ${GENERATION_PLATFORMS.map((platform) => `<option value="${platform.value}" ${normalizePlatform(shot.platform) === platform.value ? "selected" : ""}>${escapeHtml(platform.label)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="field"><span>视频模型</span>
+          <select data-shot-index="${index}" data-shot-field="video_model">
+            <option value="" ${!shot.video_model ? "selected" : ""}>自动</option>
+            ${availableVideoModels.map((model) => `<option value="${escapeHtml(model)}" ${shot.video_model === model ? "selected" : ""}>${escapeHtml(shotModelLabel(model))}</option>`).join("")}
+          </select>
+        </label>
+        <label class="field"><span>时长</span><input data-shot-index="${index}" data-shot-field="duration" value="${escapeHtml(shot.duration || "")}" placeholder="例如 10s"></label>
+        </div>
+      </details>
+      <label class="field"><span>图片提示词</span><textarea class="shot-prompt-textarea" data-shot-index="${index}" data-shot-field="image_prompt">${escapeHtml(shot.image_prompt || "")}</textarea></label>
+      <label class="field"><span>视频提示词</span><textarea class="shot-prompt-textarea" data-shot-index="${index}" data-shot-field="video_prompt">${escapeHtml(shot.video_prompt || "")}</textarea></label>
       <div class="hint">标签：${escapeHtml((shot.tag_refs || []).join(", ") || "无")}</div>
       <div class="shot-actions">
         <button data-copy-shot="${index}" data-copy-field="image_prompt">复制图片词</button>
@@ -2501,14 +3116,22 @@ function renderShotTable() {
       shot.prompt = prompt;
       shot.tag_refs = tagRefsForPrompt(prompt);
     };
-    input.addEventListener("input", applyFieldChange);
-    input.addEventListener("change", applyFieldChange);
+    input.addEventListener("input", (event) => {
+      applyFieldChange(event);
+      fitTextareaToContent(input);
+    });
+    input.addEventListener("change", (event) => {
+      applyFieldChange(event);
+      fitTextareaToContent(input);
+    });
     input.addEventListener("blur", saveShotsAndTagsFromTable);
   });
+  requestAnimationFrame(() => fitShotPromptTextareas(box));
 
   box.querySelectorAll("[data-shot-detail]").forEach((detail) => {
     detail.addEventListener("toggle", () => {
       rememberOpenId("openShotIds", detail.dataset.shotDetail, detail.open);
+      if (detail.open) requestAnimationFrame(() => fitShotPromptTextareas(detail));
     });
   });
 
@@ -2668,7 +3291,8 @@ async function normalizeTagAcrossShots(tagId) {
 
 async function importShotsFile(file) {
   const base64 = await fileToBase64(file);
-  const data = await api("/api/shots/parse-xlsx", {
+  const isHtml = /\.(html?|xhtml)$/i.test(file.name || "");
+  const data = await api(isHtml ? "/api/shots/parse-html" : "/api/shots/parse-xlsx", {
     method: "POST",
     body: JSON.stringify({
       project_id: state.projectId,
@@ -2688,7 +3312,7 @@ async function importShotsFile(file) {
   if (!conflicts.length) {
     state.shots = [...state.shots, ...incoming];
     await saveShotsAndTagsFromTable();
-    $("#shotsImportStatus").textContent = `已导入 ${incoming.length} 条分镜。`;
+    $("#shotsImportStatus").textContent = `已从${isHtml ? "网页 HTML" : "Excel"}导入 ${incoming.length} 条分镜。`;
     return;
   }
   state.pendingShotImport = {
@@ -2907,7 +3531,7 @@ function renderInspector() {
     ? `<button id="openVideoPreview">放大预览</button><button id="captureLastFrame">提取静帧</button>`
     : "";
   const promptField = ["text", "imageGen", "videoGen"].includes(node.type)
-    ? `<label class="field"><span>${node.type === "text" ? "文本提示词" : "补充提示词"}</span><textarea id="nodeText">${escapeHtml(node.type === "text" ? node.data.text || "" : node.data.prompt || "")}</textarea></label>`
+    ? `<label class="field"><span>${node.type === "text" ? "文本提示词" : "补充提示词"}</span><textarea id="nodeText" class="node-prompt-textarea">${escapeHtml(node.type === "text" ? node.data.text || "" : node.data.prompt || "")}</textarea></label>`
     : "";
   const memoField = isMemo ? `
     <div class="field">
@@ -2991,8 +3615,10 @@ function renderInspector() {
   });
   const text = $("#nodeText");
   if (text) {
+    fitTextareaToContent(text);
     text.addEventListener("input", (event) => {
       patchNodeData(node.id, node.type === "text" ? { text: event.target.value } : { prompt: event.target.value });
+      fitTextareaToContent(text);
     });
     text.addEventListener("blur", () => renderCanvasOnly());
   }
@@ -3091,7 +3717,7 @@ function renderGeneratorFields(node) {
       ? ""
       : ["1:1", "3:4", "16:9", "4:3", "9:16", "21:9"].map((size) => `<option value="${escapeHtml(size)}" ${sizeValue === size ? "selected" : ""}>${escapeHtml(size)}</option>`).join("");
     durationField = `
-      <label class="field">
+      <label class="field compact generator-field-third">
         <span>视频时长</span>
         <input id="paramDuration" type="number" min="${durationRange.min}" max="${durationRange.max}" step="1" value="${escapeHtml(durationValue)}">
         <div class="hint">支持 ${durationRange.min}-${durationRange.max} 秒</div>
@@ -3120,7 +3746,7 @@ function renderGeneratorFields(node) {
     }).join("");
     sizeOptions = sizeChoices.map((size) => `<option value="${escapeHtml(size)}" ${sizeValue === size ? "selected" : ""}>${escapeHtml(size)}</option>`).join("");
     durationField = isVideo ? `
-      <label class="field">
+      <label class="field compact generator-field-third">
         <span>视频时长</span>
         <input id="paramDuration" type="number" min="${durationRange.min}" max="${durationRange.max}" step="1" value="${escapeHtml(durationValue)}">
         <div class="hint">当前模型支持 ${durationRange.min}-${durationRange.max} 秒</div>
@@ -3137,31 +3763,27 @@ function renderGeneratorFields(node) {
   const jimengImageModeOptionsHtml = JIMENG_IMAGE_MODES.map((item) => `<option value="${item.value}" ${jimengImageMode === item.value ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
   const jimengImageResolutionOptionsHtml = jimengImageResolutionOptions(jimengImageMode, modelValue).map((item) => `<option value="${item}" ${jimengImageResolutionValue === item ? "selected" : ""}>${item}</option>`).join("");
   return `
-    <details class="submit-preview-card" open>
-      <summary>通用设置</summary>
-      <label class="field"><span>生成平台</span><select id="paramPlatform">${platformOptions}</select></label>
-      <label class="field"><span>平台模型</span><select id="paramModel">${modelOptions}</select></label>
-      ${sizeOptions ? `<label class="field"><span>${isVideo ? "视频比例" : "图片比例"}</span><select id="paramSize">${sizeOptions}</select></label>` : (isJimengVideo ? `<div class="hint">单图生视频的画幅由首帧图片决定。</div>` : "")}
+    <div class="generator-settings-grid">
+      <label class="field compact generator-field-wide"><span>模型</span><select id="paramModel">${modelOptions}</select></label>
+      <label class="field compact generator-field-third"><span>平台</span><select id="paramPlatform">${platformOptions}</select></label>
+      ${sizeOptions ? `<label class="field compact generator-field-third"><span>${isVideo ? "视频比例" : "图片比例"}</span><select id="paramSize">${sizeOptions}</select></label>` : (isJimengVideo ? `<div class="hint generator-field-wide">单图生视频的画幅由首帧图片决定。</div>` : "")}
       ${durationField}
-    </details>
-    <details class="submit-preview-card" open>
-      <summary>${escapeHtml(platformLabel(safePlatform))} 专属设置</summary>
       ${isJimengVideo ? `
-        <label class="field"><span>视频模式</span><select id="paramMode">${jimengModeOptions}</select></label>
-        <label class="field"><span>分辨率</span><select id="paramResolution">${jimengResolutionOptions}</select></label>
-        ${jimengMode === "multimodal2video" ? `<div class="hint">这条可接多张图片、视频、音频。至少一张图片或一个视频；如果连的是 URL 素材，提交时会先转成本地文件再交给即梦。</div>` : ""}
+        <label class="field compact generator-field-half"><span>视频模式</span><select id="paramMode">${jimengModeOptions}</select></label>
+        <label class="field compact generator-field-half"><span>分辨率</span><select id="paramResolution">${jimengResolutionOptions}</select></label>
+        ${jimengMode === "multimodal2video" ? `<div class="hint generator-field-wide">这条可接多张图片、视频、音频。至少一张图片或一个视频；如果连的是 URL 素材，提交时会先转成本地文件再交给即梦。</div>` : ""}
       ` : isJimengImage ? `
-        <label class="field"><span>图片模式</span><select id="paramMode">${jimengImageModeOptionsHtml}</select></label>
-        <label class="field"><span>分辨率</span><select id="paramResolution">${jimengImageResolutionOptionsHtml}</select></label>
+        <label class="field compact generator-field-half"><span>图片模式</span><select id="paramMode">${jimengImageModeOptionsHtml}</select></label>
+        <label class="field compact generator-field-half"><span>分辨率</span><select id="paramResolution">${jimengImageResolutionOptionsHtml}</select></label>
         ${jimengImageMode === "text2image"
-          ? `<div class="hint">文生图不吃参考图；如果你要用图片参考，请切到图生图。</div>`
-          : `<div class="hint">图生图支持 1-10 张图片；如果连的是 URL 图片，提交时会先转成本地文件再交给即梦。</div>`}
+          ? `<div class="hint generator-field-wide">文生图不吃参考图；如果你要用图片参考，请切到图生图。</div>`
+          : `<div class="hint generator-field-wide">图生图支持 1-10 张图片；如果连的是 URL 图片，提交时会先转成本地文件再交给即梦。</div>`}
       ` : `
-        <label class="field"><span>功能选择</span><select id="paramFeature">${featureOptions}</select></label>
-        ${needsMotion ? `<label class="field"><span>动作控制</span><textarea id="paramMotion" placeholder="例如：镜头缓慢前推，人物向右转身，手臂自然摆动">${escapeHtml(selected.motion_control || "")}</textarea></label>` : ""}
-        ${needsEdit ? `<label class="field"><span>编辑要求</span><textarea id="paramEdit" placeholder="说明要保留什么、修改什么">${escapeHtml(selected.edit_instruction || "")}</textarea></label>` : ""}
+        <label class="field compact generator-field-third"><span>功能</span><select id="paramFeature">${featureOptions}</select></label>
+        ${needsMotion ? `<label class="field compact generator-field-wide"><span>动作控制</span><textarea id="paramMotion" placeholder="例如：镜头缓慢前推，人物向右转身，手臂自然摆动">${escapeHtml(selected.motion_control || "")}</textarea></label>` : ""}
+        ${needsEdit ? `<label class="field compact generator-field-wide"><span>编辑要求</span><textarea id="paramEdit" placeholder="说明要保留什么、修改什么">${escapeHtml(selected.edit_instruction || "")}</textarea></label>` : ""}
       `}
-    </details>
+    </div>
   `;
 }
 
@@ -3390,10 +4012,12 @@ function renderJobs() {
     return;
   }
   const jobs = state.jobs.slice().reverse();
+  const queryableRunning = runningJobsForAutoRefresh();
+  const queryStatus = autoQuerySummary();
   const summary = {
     total: jobs.length,
     running: jobs.filter((job) => job.status === "running").length,
-    blocked: jobs.filter((job) => ["pending_confirmation", "rate_limited"].includes(job.status)).length,
+    blocked: jobs.filter((job) => ["needs_input", "pending_confirmation", "rate_limited"].includes(job.status)).length,
     failed: jobs.filter((job) => job.status === "failed").length,
     done: jobs.filter((job) => ["downloaded", "completed"].includes(job.status)).length,
   };
@@ -3404,8 +4028,12 @@ function renderJobs() {
       ${summary.blocked ? `<span class="bad">待处理 ${summary.blocked}</span>` : ""}
       ${summary.failed ? `<span class="bad">失败 ${summary.failed}</span>` : ""}
       ${summary.done ? `<span class="ok">完成 ${summary.done}</span>` : ""}
+      ${queryableRunning.length ? `<button type="button" class="job-summary-action" id="refreshRunningJobs">刷新全部生成中</button>` : ""}
     </div>
-  ` + jobs.map((job) => `
+    ${queryStatus ? `<div class="job-auto-query">${escapeHtml(queryStatus)}</div>` : ""}
+  ` + jobs.map((job) => {
+    const replyNote = jobReplyNote(job);
+    return `
     <details class="job-card" data-job-detail="${escapeHtml(job.job_id)}" ${state.openJobIds.includes(job.job_id) ? "open" : ""}>
       <summary>
         <span class="status-pill ${escapeHtml(statusInfoFromJob(job)?.tone || "waiting")}">${escapeHtml(statusInfoFromJob(job)?.label || job.status)}</span>
@@ -3420,6 +4048,20 @@ function renderJobs() {
           ${job.status === "pending_confirmation" ? `<button data-confirm-job="${job.job_id}">确认并继续</button>` : ""}
           ${((job.lovart_thread_id || job.jimeng_submit_id) && job.status !== "downloaded") ? `<button data-refresh-job="${job.job_id}">刷新结果</button>` : ""}
         </div>
+        ${jobNeedsLovartReply(job) ? `
+          <div class="job-reply-box">
+            <label class="field compact">
+              <span>回复 Lovart</span>
+              <textarea data-job-reply-message="${job.job_id}" placeholder="例如：选择方案 2，去掉人物参考图，仅使用场景图继续生成。">${escapeHtml(job.last_lovart_reply || "")}</textarea>
+            </label>
+            <div class="job-reply-actions">
+              ${jobLooksLikePlanConfirmation(job) ? `<button data-reply-job="${job.job_id}" data-default-reply="确认此方案，请开始生成。">确认方案并生成</button>` : ""}
+              <button data-reply-job="${job.job_id}">发送回复并继续</button>
+              <span class="job-reply-status" data-job-reply-status="${job.job_id}"></span>
+            </div>
+          </div>
+        ` : ""}
+        ${replyNote ? `<div class="job-replied-note ${escapeHtml(replyNote.tone)}">${escapeHtml(replyNote.text)}</div>` : ""}
         ${job.asset_template_label ? `<div>资产模板：${escapeHtml(job.asset_template_label)}</div>` : ""}
         <div>分镜：${escapeHtml(job.shot_ids?.length ? job.shot_ids.join(", ") : "未关联")}</div>
         <div>平台：${escapeHtml(platformLabel(job.platform))}</div>
@@ -3442,12 +4084,19 @@ function renderJobs() {
         ${job.failure_reason ? `<div class="bad">${escapeHtml(job.failure_reason)}</div>` : ""}
       </div>
     </details>
-  `).join("");
+  `;
+  }).join("");
   box.querySelectorAll("[data-refresh-job]").forEach((button) => {
     button.addEventListener("click", () => refreshJob(button.dataset.refreshJob));
   });
+  $("#refreshRunningJobs")?.addEventListener("click", () => {
+    refreshRunningJobsNow().catch((error) => setStatus(error.message, "bad"));
+  });
   box.querySelectorAll("[data-confirm-job]").forEach((button) => {
     button.addEventListener("click", () => confirmJob(button.dataset.confirmJob));
+  });
+  box.querySelectorAll("[data-reply-job]").forEach((button) => {
+    button.addEventListener("click", () => replyJob(button.dataset.replyJob, button.dataset.defaultReply || "", button));
   });
   box.querySelectorAll("[data-mark-handled-job]").forEach((button) => {
     button.addEventListener("click", () => markRateLimitedHandled(button.dataset.markHandledJob));
@@ -3556,6 +4205,7 @@ function sanitizeShotsForState(shots = []) {
     const image_prompt = normalizeInlineTagSpacing(collapseBrokenAsciiTags(shot.image_prompt || ""));
     const video_prompt = normalizeInlineTagSpacing(collapseBrokenAsciiTags(shot.video_prompt || ""));
     const duration = String(shot.duration || extractDurationFromPrompt(video_prompt) || "").trim();
+    const size = String(shot.size || extractAspectRatioFromPrompt(video_prompt) || "").trim();
     const normalized = normalizeShotPlatformAndModel(
       shot.platform,
       String(shot.video_model || "").trim(),
@@ -3563,6 +4213,9 @@ function sanitizeShotsForState(shots = []) {
       getPreferredSeedancePlatform()
     );
     const prompt = [image_prompt, video_prompt].filter(Boolean).join("\n\n");
+    const providedTags = Array.isArray(shot.tag_refs)
+      ? Array.from(new Set(shot.tag_refs.map((item) => String(item || "").trim()).filter(Boolean)))
+      : null;
     return {
       ...shot,
       image_prompt,
@@ -3570,8 +4223,9 @@ function sanitizeShotsForState(shots = []) {
       platform: normalized.platform,
       video_model: normalized.video_model,
       duration,
+      size,
       prompt,
-      tag_refs: tagRefsForPrompt(prompt),
+      tag_refs: providedTags?.length ? providedTags : tagRefsForPrompt(prompt),
     };
   });
 }
@@ -3594,18 +4248,33 @@ async function loadProject(name = state.projectId) {
   const data = await api(`/api/project?project_id=${encodeURIComponent(name)}`);
   state.project = data.project;
   state.projectId = data.project.project_id;
+  rememberLastProjectId(state.projectId);
   state.canvas = data.canvas;
   state.shots = sanitizeShotsForState(data.shots || []);
   state.tags = rebuildTagsFromShots(data.tags || []);
   state.jobs = data.jobs;
   state.assetLibrary = data.asset_library || { global_rules: "", templates: [], image_model: "agent-auto" };
+  const draft = readCanvasDraft(state.projectId);
+  if (draft?.canvas) {
+    state.canvas = mergeCanvasDraftWithServer(draft.canvas, state.canvas);
+    state.canvasDirty = true;
+  }
   clearNodeSelection();
   clearConnectSources();
   state.selectedEdgeId = null;
   $("#projectLabel").textContent = "分镜、素材和任务都保存在这个项目里";
   $("#projectName").value = state.projectId;
-  setStatus("项目已加载。", "ok");
+  setStatus(draft?.canvas ? "项目已加载，并恢复了一份未同步的本地备份。" : "项目已加载。", "ok");
   render();
+  if (draft?.canvas) {
+    renderCanvasDraftNotice(draft);
+    saveCanvas({ silent: true }).catch((error) => {
+      setStatus(`本地备份已恢复，但同步失败：${error.message}`, "bad");
+    });
+  } else {
+    renderCanvasDraftNotice(null);
+  }
+  requestAnimationFrame(() => requestAnimationFrame(() => fitToNodes({ silent: true })));
 }
 
 function upsertJob(job) {
@@ -3614,26 +4283,45 @@ function upsertJob(job) {
   else state.jobs.unshift(job);
 }
 
+function renderJobStateOnly() {
+  renderToolbarState();
+  renderShotTable();
+  renderJobs();
+  renderReview();
+}
+
 async function syncJobsState(silent = false) {
-  if (state.canvasDirty || inspectorRecentlyActive() || isEditingElement(document.activeElement)) return;
+  if (state.canvasDirty || canvasInteractionBusy() || inspectorRecentlyActive() || isEditingElement(document.activeElement)) return;
   const data = await api(`/api/jobs/state?project_id=${encodeURIComponent(state.projectId)}`);
   state.jobs = data.jobs || [];
   state.canvas = data.canvas || state.canvas;
   state.assetLibrary = data.asset_library || state.assetLibrary;
   render();
   if (!silent) setStatus("任务状态已更新。", "ok");
+  if (state.bulkSubmit.active) {
+    processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+  }
 }
 
 async function saveCanvas(options = {}) {
-  await api("/api/canvas/save", {
-    method: "POST",
-    body: JSON.stringify({ project_id: state.projectId, canvas: state.canvas }),
-  });
-  state.canvasDirty = false;
-  if (!options.silent) setStatus("画布已保存。", "ok");
+  saveCanvasDraft("before_server_save");
+  try {
+    await api("/api/canvas/save", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, canvas: state.canvas }),
+    });
+    state.canvasDirty = false;
+    clearCanvasDraft();
+    if (!options.silent) setStatus("画布已保存。", "ok");
+  } catch (error) {
+    state.canvasDirty = true;
+    saveCanvasDraft("server_save_failed", { showNotice: true });
+    throw new Error(`服务器保存失败，已保留本地备份：${error.message}`);
+  }
 }
 
 function scheduleCanvasSave(delay = 600) {
+  saveCanvasDraft("auto_pending", { showNotice: false });
   if (state.canvasSaveTimer) clearTimeout(state.canvasSaveTimer);
   state.canvasSaveTimer = setTimeout(async () => {
     state.canvasSaveTimer = null;
@@ -3741,6 +4429,17 @@ async function importAssetLibraryFile(file) {
   setStatus(`已导入 ${state.assetLibrary.templates.length} 个资产模板。`, "ok");
 }
 
+async function importAssetLibraryJsonlFile(file) {
+  const base64 = await fileToBase64(file);
+  const data = await api("/api/asset-library/import-jsonl", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, base64 }),
+  });
+  state.assetLibrary = data.asset_library;
+  renderAssetLibrary();
+  setStatus(`已导入 ${state.assetLibrary.templates.length} 个 JSONL 资产模板。`, "ok");
+}
+
 async function createAssetTemplateNodes(templateIds = state.assetLibrary.templates.map((item) => item.template_id)) {
   const templates = state.assetLibrary.templates.filter((item) => templateIds.includes(item.template_id));
   if (!templates.length) {
@@ -3772,7 +4471,14 @@ async function createAssetTemplateNodes(templateIds = state.assetLibrary.templat
   setStatus(`已生成/更新 ${changed} 个资产图片节点。接下来可逐条提交生成。`, "ok");
 }
 
-async function importAsset(file) {
+function folderImportDepth(file) {
+  const relativePath = String(file.webkitRelativePath || "");
+  if (!relativePath) return 0;
+  const parts = relativePath.split("/").filter(Boolean);
+  return Math.max(0, parts.length - 2);
+}
+
+async function importAsset(file, options = {}) {
   const base64 = await fileToBase64(file);
   const data = await api("/api/assets/import", {
     method: "POST",
@@ -3785,13 +4491,38 @@ async function importAsset(file) {
       asset_category: "other",
     }),
   });
-  state.canvas = data.canvas;
+  state.canvas = { ...state.canvas, assets: data.canvas?.assets || state.canvas.assets };
   state.pendingDeleteAssetId = null;
   const node = addAssetNode(data.asset);
+  if (options.focus !== false) {
+    ensureLeftSectionExpanded("assets");
+    focusNode(node);
+  }
+  return { asset: data.asset, node };
+}
+
+async function importAssetFiles(files, options = {}) {
+  const allFiles = Array.from(files || []).filter((file) => file && file.size >= 0);
+  if (!allFiles.length) return;
+  const maxDepth = options.folder ? 2 : Infinity;
+  const allowedFiles = allFiles.filter((file) => folderImportDepth(file) <= maxDepth);
+  const skipped = allFiles.length - allowedFiles.length;
+  if (!allowedFiles.length) {
+    setStatus("没有可导入的素材。文件夹导入只读取两级内的文件。", "bad");
+    return;
+  }
+  setStatus(`正在导入 ${allowedFiles.length} 个素材...`);
+  const imported = [];
+  for (const file of allowedFiles) {
+    const result = await importAsset(file, { focus: false });
+    imported.push(result);
+  }
   ensureLeftSectionExpanded("assets");
-  focusNode(node);
+  const lastNode = imported[imported.length - 1]?.node;
+  if (lastNode) focusNode(lastNode);
   await saveCanvas();
-  setStatus(`已导入素材：${data.asset.name}，已默认标记为资产并定位到画布。`, "ok");
+  const skippedText = skipped ? `，跳过 ${skipped} 个超过两级的文件` : "";
+  setStatus(`已导入 ${imported.length} 个素材${skippedText}。已默认标记为资产并放到画布。`, "ok");
 }
 
 async function importRemoteAsset() {
@@ -3908,6 +4639,10 @@ function runningJobsForAutoRefresh() {
   return state.jobs.filter((job) => job.status === "running" && (job.lovart_thread_id || job.jimeng_submit_id) && !state.jobActionLocks.has(job.job_id));
 }
 
+function runningJobsMissingPlatformHandle() {
+  return state.jobs.filter((job) => job.status === "running" && !job.lovart_thread_id && !job.jimeng_submit_id);
+}
+
 function runningJobsWaitingForThread() {
   return state.jobs.filter((job) => (
     job.status === "running" && !job.lovart_thread_id && !job.jimeng_submit_id
@@ -3916,8 +4651,22 @@ function runningJobsWaitingForThread() {
   ));
 }
 
+function autoQuerySummary() {
+  const queryable = runningJobsForAutoRefresh().length;
+  const missingHandle = runningJobsMissingPlatformHandle().length;
+  const parts = [];
+  if (queryable) parts.push(`自动查询中：${queryable} 个，每 12 秒轮询`);
+  if (state.autoRefreshingJobId) parts.push(`正在查 ${state.autoRefreshingJobId}`);
+  if (missingHandle) parts.push(`${missingHandle} 个缺少平台会话，无法查询`);
+  return parts.join("；");
+}
+
+function canvasInteractionBusy() {
+  return Boolean(state.pan || state.marquee || state.nodeDrag || state.leftPanelResize);
+}
+
 function scheduleAutoRefresh() {
-  if (state.canvasDirty || inspectorRecentlyActive()) {
+  if (state.canvasDirty || canvasInteractionBusy() || inspectorRecentlyActive()) {
     if (!state.autoRefreshTimer && !state.syncJobsTimer) {
       state.syncJobsTimer = setTimeout(() => {
         state.syncJobsTimer = null;
@@ -3954,7 +4703,7 @@ function scheduleAutoRefresh() {
 
 async function autoRefreshRunningJobs() {
   if (state.autoRefreshingJobId) return;
-  if (inspectorRecentlyActive()) {
+  if (canvasInteractionBusy() || inspectorRecentlyActive()) {
     scheduleAutoRefresh();
     return;
   }
@@ -3969,6 +4718,21 @@ async function autoRefreshRunningJobs() {
     state.autoRefreshingJobId = null;
     scheduleAutoRefresh();
   }
+}
+
+async function refreshRunningJobsNow() {
+  const jobs = runningJobsForAutoRefresh().slice();
+  if (!jobs.length) {
+    const missing = runningJobsMissingPlatformHandle().length;
+    setStatus(missing ? `${missing} 个生成中任务缺少平台会话 ID，无法查询，建议重新提交。` : "当前没有可查询的生成中任务。", missing ? "bad" : "");
+    return;
+  }
+  setStatus(`正在查询 ${jobs.length} 个生成中任务...`);
+  for (const job of jobs) {
+    await refreshJob(job.job_id, { silent: true, source: "manual_all" });
+  }
+  setStatus(`已查询 ${jobs.length} 个生成中任务。`, "ok");
+  scheduleAutoRefresh();
 }
 
 async function refreshJob(jobId, options = {}) {
@@ -3986,7 +4750,11 @@ async function refreshJob(jobId, options = {}) {
     state.canvas = fresh.canvas;
     state.project = fresh.project;
     state.assetLibrary = fresh.asset_library || state.assetLibrary;
-    render();
+    if (silent && !result.ok) {
+      renderJobStateOnly();
+    } else {
+      render();
+    }
     if (!result.ok) {
       if (!silent) {
         setStatus(result.error || "平台还没有可下载结果。", "bad");
@@ -3997,6 +4765,9 @@ async function refreshJob(jobId, options = {}) {
       setStatus("平台结果已下载并挂回画布。", "ok");
     } else if ((result.assets || []).length) {
       setStatus("平台结果已自动下载并挂回画布。", "ok");
+    }
+    if (state.bulkSubmit.active) {
+      processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
     }
   } finally {
     state.jobActionLocks.delete(jobId);
@@ -4027,8 +4798,68 @@ async function confirmJob(jobId) {
       return;
     }
     setStatus((result.assets || []).length ? "Lovart 已确认并下载结果。" : "Lovart 已确认，这条结果之前已经拿回来了。", "ok");
+    if (state.bulkSubmit.active) {
+      processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+    }
   } finally {
     state.jobActionLocks.delete(jobId);
+  }
+}
+
+function setJobReplyFeedback(jobId, message, tone = "") {
+  const el = document.querySelector(`[data-job-reply-status="${CSS.escape(jobId)}"]`);
+  if (!el) return;
+  el.textContent = message || "";
+  el.className = `job-reply-status ${tone}`.trim();
+}
+
+async function replyJob(jobId, defaultMessage = "", triggerButton = null) {
+  if (state.jobActionLocks.has(jobId)) return;
+  const textarea = document.querySelector(`[data-job-reply-message="${CSS.escape(jobId)}"]`);
+  const message = String(textarea?.value || defaultMessage || "").trim();
+  if (!message) {
+    setStatus("先写一句给 Lovart 的处理方式。", "bad");
+    textarea?.focus();
+    return;
+  }
+  state.jobActionLocks.add(jobId);
+  const originalButtonText = triggerButton?.textContent || "";
+  if (triggerButton) {
+    triggerButton.disabled = true;
+    triggerButton.textContent = "发送中...";
+  }
+  setJobReplyFeedback(jobId, "正在发送到 Lovart...");
+  setStatus("正在把处理方式发回 Lovart...");
+  try {
+    const result = await api("/api/jobs/reply", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, job_id: jobId, message }),
+    });
+    const fresh = await api(`/api/project?project_id=${encodeURIComponent(state.projectId)}`);
+    state.jobs = fresh.jobs;
+    state.canvas = fresh.canvas;
+    state.project = fresh.project;
+    state.assetLibrary = fresh.asset_library || state.assetLibrary;
+    render();
+    if (!result.ok) {
+      setJobReplyFeedback(jobId, "发送失败", "bad");
+      setStatus(result.error || "Lovart 回复后还没有可下载结果。", "bad");
+      return;
+    }
+    if (result.pending) {
+      setStatus("Lovart 已收到处理方式，继续生成中。", "ok");
+      return;
+    }
+    setStatus((result.assets || []).length ? "Lovart 已继续生成并下载结果。" : "Lovart 已处理，这条结果之前已经拿回来了。", "ok");
+    if (state.bulkSubmit.active) {
+      processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+    }
+  } finally {
+    state.jobActionLocks.delete(jobId);
+    if (triggerButton?.isConnected) {
+      triggerButton.disabled = false;
+      triggerButton.textContent = originalButtonText;
+    }
   }
 }
 
@@ -4042,6 +4873,9 @@ async function markRateLimitedHandled(jobId) {
   state.assetLibrary = fresh.asset_library || state.assetLibrary;
   renderJobs();
   setStatus(result.ok ? "并发限制已标记为处理完成，可以重新提交。" : "状态更新失败。", result.ok ? "ok" : "bad");
+  if (state.bulkSubmit.active) {
+    processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+  }
 }
 
 function fileToBase64(file) {
@@ -4071,6 +4905,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   window.addEventListener("resize", () => {
     renderCanvasOnly();
   });
+  window.addEventListener("beforeunload", (event) => {
+    if (!state.canvasDirty && !readCanvasDraft()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
   $("#toggleLeftPanel").addEventListener("click", () => {
     const collapsed = document.body.classList.toggle("left-collapsed");
     $("#toggleLeftPanel").textContent = collapsed ? "显示左栏" : "隐藏左栏";
@@ -4085,10 +4924,24 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
   $("#createProject").addEventListener("click", openProjectPicker);
   $("#saveProjectRoot").addEventListener("click", saveProjectRoot);
-  $("#saveCanvas").addEventListener("click", saveCanvas);
-  $("#assetFile").addEventListener("change", (event) => {
-    const file = event.target.files?.[0];
-    if (file) importAsset(file);
+  $("#saveCanvas").addEventListener("click", () => {
+    saveCanvas().catch((error) => setStatus(error.message, "bad"));
+  });
+  $("#restoreCanvasDraft")?.addEventListener("click", () => {
+    restoreCanvasDraft().catch((error) => setStatus(`恢复本地备份失败：${error.message}`, "bad"));
+  });
+  $("#discardCanvasDraft")?.addEventListener("click", () => {
+    clearCanvasDraft();
+    setStatus("已忽略本地备份。", "ok");
+  });
+  $("#assetFile").addEventListener("change", async (event) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length) await importAssetFiles(files);
+    event.target.value = "";
+  });
+  $("#assetFolder")?.addEventListener("change", async (event) => {
+    const files = Array.from(event.target.files || []);
+    if (files.length) await importAssetFiles(files, { folder: true });
     event.target.value = "";
   });
   $("#openShotsImport")?.addEventListener("click", () => {
@@ -4127,14 +4980,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (file) await importAssetLibraryFile(file);
     event.target.value = "";
   });
+  $("#assetLibraryJsonlFile").addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (file) await importAssetLibraryJsonlFile(file);
+    event.target.value = "";
+  });
   document.querySelectorAll("[data-add]").forEach((button) => {
     button.addEventListener("click", () => addNode(button.dataset.add, defaultNodeData(button.dataset.add)));
   });
   document.querySelectorAll("[data-context-add]").forEach((button) => {
     button.addEventListener("click", () => {
-      const position = state.contextPoint || screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
-      addNode(button.dataset.contextAdd, defaultNodeData(button.dataset.contextAdd), position);
-      hideContextMenu();
+      addNodeFromContext(button.dataset.contextAdd);
     });
   });
   document.querySelectorAll("[data-right-tab]").forEach((button) => {
@@ -4157,14 +5013,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
   $("#connectMode").addEventListener("click", () => {
     hideContextMenu();
-    const selected = selectedNodes();
-    if (!selected.length) return setStatus("先选择一个作为输出的节点。");
-    const sameTypeSelection = selected.length > 1 && selected.every((node) => node.type === selected[0].type);
-    const sourceIds = sameTypeSelection ? selected.map((node) => node.id) : [selectedNode()?.id].filter(Boolean);
-    setConnectSources(sourceIds);
-    state.selectedEdgeId = null;
-    setStatus(sourceIds.length > 1 ? `已选择 ${sourceIds.length} 个同类型输出节点。再点目标节点完成批量连线。` : `已选择输出：${nodeTitle(selectedNode())}。再点目标节点完成连线。`);
-    render();
+    startConnectFromSelection();
+  });
+  $("#bulkSubmitSelected").addEventListener("click", () => {
+    hideContextMenu();
+    startBulkSubmitSelected();
   });
   $("#deleteEdge").addEventListener("click", () => {
     hideContextMenu();
@@ -4252,21 +5105,40 @@ document.addEventListener("DOMContentLoaded", async () => {
     render();
   });
   canvasEl.addEventListener("contextmenu", (event) => {
-    if (event.target !== canvasEl && event.target !== worldEl) return;
+    const portHit = findPortAtScreen(event.clientX, event.clientY);
+    if (!portHit && event.target !== canvasEl && event.target !== worldEl) return;
     event.preventDefault();
-    state.contextPoint = screenToWorld(event.clientX, event.clientY);
-    contextMenu.style.left = `${event.clientX}px`;
-    contextMenu.style.top = `${event.clientY}px`;
-    contextMenu.hidden = false;
+    state.selectionMode = false;
+    state.marquee = null;
+    renderToolbarState();
+    if (portHit) {
+      openCanvasContextMenu(
+        event.clientX,
+        event.clientY,
+        nodePortInsertPosition(portHit.node, portHit.port),
+        { nodeId: portHit.node.id, port: portHit.port }
+      );
+      return;
+    }
+    openCanvasContextMenu(event.clientX, event.clientY, screenToWorld(event.clientX, event.clientY));
   });
   canvasEl.addEventListener("wheel", (event) => {
     hideContextMenu();
     event.preventDefault();
     zoomAt(event.clientX, event.clientY, event.deltaY);
   }, { passive: false });
+  canvasEl.addEventListener("auxclick", (event) => {
+    if (event.button === 1) event.preventDefault();
+  });
   canvasEl.addEventListener("pointerdown", (event) => {
+    if (event.button === 1) {
+      hideContextMenu();
+      beginCanvasPan(event);
+      return;
+    }
     if (event.target !== canvasEl && event.target !== worldEl) return;
     hideContextMenu();
+    if (event.button === 2) return;
     if (state.selectionMode || event.shiftKey) {
       state.marquee = {
         startX: event.clientX,
@@ -4279,13 +5151,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       renderCanvasOnly();
       return;
     }
-    state.pan = {
-      startX: event.clientX,
-      startY: event.clientY,
-      originX: state.viewport.x,
-      originY: state.viewport.y,
-      moved: false,
-    };
+    beginCanvasPan(event);
   });
   window.addEventListener("pointermove", (event) => {
     if (state.marquee) {
@@ -4328,6 +5194,27 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!$("#videoPreviewModal")?.hidden) closeVideoPreview();
     }
     const editing = isEditingElement(event.target) || isEditingElement(document.activeElement);
+    if (!editing && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      const key = event.key.toLowerCase();
+      if (key === "m") {
+        event.preventDefault();
+        hideContextMenu();
+        toggleSelectionMode();
+        return;
+      }
+      if (key === "c") {
+        event.preventDefault();
+        hideContextMenu();
+        startConnectFromSelection();
+        return;
+      }
+      if (key === "f") {
+        event.preventDefault();
+        hideContextMenu();
+        fitToNodes();
+        return;
+      }
+    }
     if ((event.key === "Backspace" || event.key === "Delete") && inspectorRecentlyActive()) {
       return;
     }
@@ -4342,7 +5229,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   try {
     await loadSettings();
-    await loadProject(state.projectId);
+    await loadProject(await initialProjectId());
     api("/api/lovart/parameters")
       .then((params) => {
         state.params = params;

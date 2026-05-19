@@ -23,6 +23,11 @@
         </div>
       </div>
     </header>
+    <div id="canvasDraftNotice" class="draft-notice" hidden>
+      <span id="canvasDraftText"></span>
+      <button id="restoreCanvasDraft">恢复本地备份</button>
+      <button id="discardCanvasDraft">忽略备份</button>
+    </div>
 
     <main class="shell">
       <aside class="panel left">
@@ -54,21 +59,19 @@
 
         <section class="left-section collapsed" data-section-id="node-tools">
           <button class="section-toggle" data-toggle-section="node-tools" aria-expanded="false">
-            <h2>添加节点</h2>
+            <h2>素材导入</h2>
             <span class="section-chevron">▾</span>
           </button>
           <div class="section-body">
-            <div class="grid-actions">
-              <button data-add="text">文本</button>
-              <button data-add="memo">备忘录</button>
-              <button data-add="imageGen">图片生成</button>
-              <button data-add="videoGen">视频生成</button>
-            </div>
-            <p class="hint">也可以在画布空白处右键添加到鼠标位置。</p>
             <label class="file-button">
               导入本地素材
-              <input id="assetFile" type="file" hidden>
+              <input id="assetFile" type="file" multiple hidden>
             </label>
+            <label class="file-button">
+              导入素材文件夹
+              <input id="assetFolder" type="file" multiple webkitdirectory hidden>
+            </label>
+            <p class="hint">文件夹导入只读取当前文件夹往下两级内的文件。</p>
             <div class="remote-asset-import">
               <input id="remoteAssetUrl" type="text" placeholder="粘贴角色库图片 URL">
               <input id="remoteAssetName" type="text" placeholder="素材名称（可选）">
@@ -83,7 +86,7 @@
             <span class="section-chevron">▾</span>
           </button>
           <div class="section-body">
-            <p class="hint">上传 Excel，支持 5 列：分镜号 | 衔接方式 | 图片提示词 | 视频提示词 | 模型推荐（可选）。衔接方式支持：新建首帧、接上一尾帧、视频直出。</p>
+            <p class="hint">上传 Excel 或本地网页 HTML。Excel 支持 5 列：分镜号 | 衔接方式 | 图片提示词 | 视频提示词 | 模型推荐（可选）。HTML 会读取 Seedance 提示词块并转成同样的五列结构。</p>
             <label class="field compact">
               <span>Seedance 默认平台</span>
               <select id="seedancePlatformPreference">
@@ -92,8 +95,8 @@
               </select>
             </label>
             <label class="file-button">
-              选择分镜 Excel
-              <input id="shotsFile" type="file" accept=".xlsx" hidden>
+              选择分镜 Excel / HTML
+              <input id="shotsFile" type="file" accept=".xlsx,.html,.htm" hidden>
             </label>
             <div id="shotsImportStatus" class="hint"></div>
           </div>
@@ -109,6 +112,10 @@
             <label class="file-button">
               选择资产 Markdown
               <input id="assetLibraryFile" type="file" accept=".md,.markdown,.txt" hidden>
+            </label>
+            <label class="file-button">
+              选择资产 JSONL
+              <input id="assetLibraryJsonlFile" type="file" accept=".jsonl,.txt" hidden>
             </label>
             <div class="field compact">
               <span>统一图片模型</span>
@@ -153,6 +160,7 @@
         <div class="canvas-toolbar">
           <button id="toggleMarqueeMode">框选多选</button>
           <button id="connectMode">开始连线</button>
+          <button id="bulkSubmitSelected">批量提交</button>
           <button id="deleteEdge">删除连线</button>
           <button id="alignLeft">左对齐</button>
           <button id="alignTop">上对齐</button>
@@ -163,6 +171,7 @@
           <button id="zoomIn">放大</button>
           <button id="fitCanvas">适配全部</button>
           <button id="resetView">重置视图</button>
+          <span id="bulkSubmitStatus" class="bulk-submit-status"></span>
           <span id="status">准备就绪</span>
         </div>
         <div id="canvas" class="canvas"></div>
