@@ -2,23 +2,36 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const vm = require("vm");
 
 process.env.AI_VIDEO_PROJECTS_DIR = path.join(__dirname, "projects");
 
 const {
   assetsFromLovartResult,
   assetTemplateOutputName,
+  blockingJobs,
   buildTags,
+  canStartQueuedJob,
   cleanGeneratedAssets,
   connectImageResultsToShotVideo,
   createProject,
+  defaultPromptFeedbackPresets,
+  deepSeekHttpErrorMessage,
+  extractJsonObject,
+  isJimengVipModel,
+  jobBlocksSubmission,
   loadProject,
+  normalizeDeepSeekBaseUrl,
+  normalizePromptOptimization,
   placeResultNodes,
   parseShotlistHtml,
   parseAssetLibraryJsonl,
   parseShots,
+  pruneDormantJobsForTarget,
+  rateLimitHandledReason,
   recordProcessedDownloads,
   safeName,
+  saveScript,
   uniquePath,
 } = require("./server");
 
@@ -46,6 +59,76 @@ assert.deepEqual(doctor.bound_asset_ids, ["asset_1"]);
 assert.deepEqual(doctor.referenced_by_shot_ids, ["1", "2"]);
 
 assert.equal(safeName('a/b:c*?"<>|'), "a_b_c______");
+const appSource = fs.readFileSync(path.join(__dirname, "public", "app.js"), "utf8");
+const tagHelperSource = appSource.slice(appSource.indexOf("function tagsFromText"), appSource.indexOf("function firstAvailableModel"));
+const tagHelperContext = { result: null };
+vm.runInNewContext(`${tagHelperSource}
+result = tagRefsForPrompt("@里奥父亲 看向门口", [
+  { label: "@里奥", aliases: [] },
+  { label: "@里奥父亲", aliases: [] },
+]);`, tagHelperContext);
+assert.deepEqual(tagHelperContext.result, ["@里奥父亲"]);
+vm.runInNewContext(`${tagHelperSource}
+result = tagRefsForPrompt("@Night Beach Camp — fog rolls in", [
+  { label: "@Night", aliases: [] },
+  { label: "@Night Beach Camp", aliases: [] },
+]);`, tagHelperContext);
+assert.deepEqual(tagHelperContext.result, ["@Night Beach Camp"]);
+assert.equal(rateLimitHandledReason({ platform: "lovart" }), "Lovart 并发限制已标记为处理完成，可重新提交任务。");
+assert.equal(isJimengVipModel("seedance2.0fast_vip"), true);
+assert.equal(isJimengVipModel("seedance2.0fast"), false);
+const jimengRateLimitedJob = { status: "rate_limited", platform: "jimeng_cli" };
+const activeJimengJob = { status: "running", platform: "jimeng_cli", jimeng_submit_id: "submit_1" };
+assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast" }, [jimengRateLimitedJob, activeJimengJob]), true);
+assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast" }, [jimengRateLimitedJob]), false);
+assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast_vip" }), false);
+assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "lovart", model: "generate_video_seedance_v2_0_fast" }), false);
+assert.equal(blockingJobs([jimengRateLimitedJob], { platform: "jimeng_cli", model: "seedance2.0_vip" }).length, 0);
+assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0fast" } }), false);
+assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0fast_vip" } }), true);
+assert.equal(
+  canStartQueuedJob(
+    Array.from({ length: 8 }, (_, index) => ({ job_id: `lovart_${index}`, status: "running", platform: "lovart", lovart_thread_id: `thread_${index}` })),
+    { platform: "lovart" }
+  ),
+  true
+);
+assert.equal(
+  canStartQueuedJob(
+    [
+      ...Array.from({ length: 8 }, (_, index) => ({ job_id: `lovart_${index}`, status: "running", platform: "lovart", lovart_thread_id: `thread_${index}` })),
+      { job_id: "submitting_lovart", status: "running", platform: "lovart" },
+    ],
+    { platform: "lovart" }
+  ),
+  false
+);
+assert.equal(
+  canStartQueuedJob(
+    Array.from({ length: 9 }, (_, index) => ({ job_id: `lovart_${index}`, status: "running", platform: "lovart", lovart_thread_id: `thread_${index}` })),
+    { platform: "lovart" }
+  ),
+  false
+);
+assert.equal(
+  canStartQueuedJob(
+    [
+      { job_id: "hit_limit", status: "rate_limited", platform: "lovart" },
+      { job_id: "active_lovart", status: "running", platform: "lovart" },
+    ],
+    { platform: "lovart" }
+  ),
+  false
+);
+assert.deepEqual(
+  pruneDormantJobsForTarget([
+    { job_id: "old_wait", target_node_id: "node_1", status: "queued" },
+    { job_id: "old_failed", target_node_id: "node_1", status: "failed" },
+    { job_id: "active", target_node_id: "node_1", status: "running" },
+    { job_id: "other", target_node_id: "node_2", status: "queued" },
+  ], "node_1").map((job) => job.job_id),
+  ["active", "other"]
+);
 
 const jsonlLibrary = parseAssetLibraryJsonl(`{"asset":"Jack Blackwood","category":"character","filename":"jack_blackwood.png","use":"Main character identity anchor for ship, beach, jungle, and camp scenes.","prompt":"portrait prompt","negative":"bad hands","source_file":"01_角色资产.md"}`);
 assert.equal(jsonlLibrary.templates.length, 1);
@@ -96,7 +179,7 @@ assert.ok(!sectionHtmlShots[0].tag_refs.includes("@Night"));
 
 const project = createProject("测试项目");
 assert.equal(project.project.project_id, "测试项目");
-for (const fileName of ["project.json", "canvas.json", "shots.json", "tags.json", "jobs.json", "asset_library.json"]) {
+for (const fileName of ["project.json", "canvas.json", "shots.json", "tags.json", "jobs.json", "prompt_context.json", "script.json", "asset_library.json"]) {
   assert.ok(fs.existsSync(path.join(__dirname, "projects", "测试项目", fileName)));
 }
 for (const dirName of ["input", "images", "videos", "thumbnails", "logs"]) {
@@ -110,6 +193,41 @@ assert.equal(path.basename(uniquePath(dir, "分镜1.png")), "分镜1_2.png");
 
 const loaded = loadProject("测试项目");
 assert.ok(Array.isArray(loaded.canvas.nodes));
+assert.ok(Array.isArray(loaded.prompt_context.learnings));
+assert.deepEqual(loaded.prompt_context.feedback_presets, defaultPromptFeedbackPresets());
+assert.ok(Array.isArray(loaded.script.segments));
+
+const savedScript = saveScript("测试项目", {
+  source_text: "第一场\n角色进入门诊室。",
+  segments: [{ segment_id: "scriptseg_1", title: "分镜1", text: "角色进入门诊室。", created_at: "now" }],
+  bindings: [{ shot_id: "1", segment_id: "scriptseg_1" }],
+});
+assert.equal(savedScript.segments.length, 1);
+assert.equal(savedScript.bindings[0].shot_id, "1");
+
+const optimized = normalizePromptOptimization({ revised_image_prompt: "new image" }, { image_prompt: "old image", video_prompt: "old video" });
+assert.equal(optimized.revised_image_prompt, "new image");
+assert.equal(optimized.revised_video_prompt, "old video");
+assert.deepEqual(optimized.project_learning_suggestions, []);
+const tagPreserved = normalizePromptOptimization(
+  { revised_image_prompt: "new image", revised_video_prompt: "new video" },
+  { image_prompt: "@女医生 old image", video_prompt: "@门诊室 old video", model: "generate_video_seedance_v2_0_fast" }
+);
+assert.ok(tagPreserved.revised_image_prompt.startsWith("@女医生"));
+assert.ok(tagPreserved.revised_video_prompt.startsWith("@门诊室"));
+assert.match(tagPreserved.warnings.join("\n"), /自动补回/);
+const klingNoTagBackfill = normalizePromptOptimization(
+  { revised_video_prompt: "natural language video" },
+  { video_prompt: "@女医生 old video", model: "generate_video_kling_v2_6" }
+);
+assert.equal(klingNoTagBackfill.revised_video_prompt, "natural language video");
+assert.throws(() => extractJsonObject("not json"), /模型返回格式异常|Unexpected token/);
+assert.equal(normalizeDeepSeekBaseUrl("http://api.deepseek.com/"), "https://api.deepseek.com");
+assert.equal(normalizeDeepSeekBaseUrl("api.deepseek.com/v1/"), "https://api.deepseek.com/v1");
+assert.match(
+  deepSeekHttpErrorMessage(301, { raw: "<html><h1>301 Moved Permanently</h1><center>openresty</center></html>" }, { location: "https://api.deepseek.com/chat/completions" }),
+  /Base URL/
+);
 
 const dedupeJob = { kind: "image", shot_ids: ["1"], processed_download_keys: [] };
 const downloadedFile = path.join(dir, "lovart_tmp.png");

@@ -6,6 +6,9 @@ const state = {
   tags: [],
   jobs: [],
   assetLibrary: { global_rules: "", templates: [], image_model: "agent-auto" },
+  promptContext: { learnings: [], feedback_presets: [] },
+  script: { source_text: "", segments: [], bindings: [] },
+  scriptSelection: { text: "", start: 0, end: 0 },
   selectedNodeId: null,
   selectedNodeIds: [],
   openShotIds: [],
@@ -34,6 +37,12 @@ const state = {
   pendingTagPickerSelection: [],
   tagPickerHoverAssetId: null,
   pendingSeedanceImportResolver: null,
+  promptOptimizer: {
+    target: null,
+    feedback: "",
+    result: null,
+    loading: false,
+  },
   autoRefreshTimer: null,
   autoRefreshingJobId: null,
   syncJobsTimer: null,
@@ -57,6 +66,7 @@ const state = {
   availableProjects: [],
   rightTab: "inspector",
   leftPanelResize: null,
+  rightPanelResize: null,
 };
 
 const WORKFLOW_PRESETS = {
@@ -95,12 +105,23 @@ const JIMENG_IMAGE_MODELS = {
 };
 const SHOT_SEEDANCE_PLATFORM_KEY = "ai-video-seedance-platform";
 const LEFT_PANEL_WIDTH_KEY = "ai-video-left-panel-width";
+const RIGHT_PANEL_WIDTH_KEY = "ai-video-right-panel-width";
 const LAST_PROJECT_KEY = "ai-video-last-project-id";
 const CANVAS_DRAFT_PREFIX = "ai-video-canvas-draft:";
 const CANVAS_MIN_SCALE = 0.1;
 const CANVAS_MAX_SCALE = 2.5;
 const CONTEXT_NODE_GAP = 90;
 const BULK_SUBMIT_LOVART_ACTIVE_LIMIT = 9;
+const DEFAULT_PROMPT_FEEDBACK_PRESETS = [
+  "人物不像",
+  "动作太多",
+  "镜头不稳",
+  "不要新增人物",
+  "更电影感",
+  "保留 @ 标签",
+  "减少肢体变形",
+  "保持上一镜连续性",
+];
 
 function workflowPreset(workflowId = DEFAULT_WORKFLOW_ID) {
   return WORKFLOW_PRESETS[workflowId] || WORKFLOW_PRESETS[DEFAULT_WORKFLOW_ID];
@@ -266,6 +287,18 @@ function applyLeftPanelWidth(width) {
   localStorage.setItem(LEFT_PANEL_WIDTH_KEY, String(next));
 }
 
+function rightPanelWidth() {
+  const value = Number(localStorage.getItem(RIGHT_PANEL_WIDTH_KEY) || "");
+  if (Number.isFinite(value) && value >= 292 && value <= 720) return value;
+  return 360;
+}
+
+function applyRightPanelWidth(width) {
+  const next = Math.max(292, Math.min(720, Math.round(width)));
+  document.documentElement.style.setProperty("--right-panel-width", `${next}px`);
+  localStorage.setItem(RIGHT_PANEL_WIDTH_KEY, String(next));
+}
+
 function lastProjectId() {
   return (localStorage.getItem(LAST_PROJECT_KEY) || "").trim();
 }
@@ -303,6 +336,14 @@ function formatTimeLabel(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(value >= 10 * 1024 * 1024 ? 1 : 2)}MB`;
+  if (value >= 1024) return `${Math.round(value / 1024)}KB`;
+  return `${Math.round(value)}B`;
 }
 
 function nodeTitle(node) {
@@ -382,6 +423,7 @@ function clearPendingCanvasDelete() {
 }
 
 function bindLeftPanelResize() {
+  const leftResizeHandle = $("#leftResizeHandle");
   if (!leftResizeHandle) return;
   leftResizeHandle.addEventListener("pointerdown", (event) => {
     if (document.body.classList.contains("left-collapsed")) return;
@@ -403,6 +445,35 @@ function bindLeftPanelResize() {
     if (!state.leftPanelResize) return;
     state.leftPanelResize = null;
     document.body.classList.remove("resizing-left");
+    render();
+  };
+  window.addEventListener("pointerup", stopResize);
+  window.addEventListener("pointercancel", stopResize);
+}
+
+function bindRightPanelResize() {
+  const rightResizeHandle = $("#rightResizeHandle");
+  if (!rightResizeHandle) return;
+  rightResizeHandle.addEventListener("pointerdown", (event) => {
+    if (document.body.classList.contains("right-collapsed")) return;
+    state.rightPanelResize = {
+      startX: event.clientX,
+      startWidth: rightPanelWidth(),
+    };
+    document.body.classList.add("resizing-right");
+    rightResizeHandle.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+  window.addEventListener("pointermove", (event) => {
+    if (!state.rightPanelResize) return;
+    const delta = state.rightPanelResize.startX - event.clientX;
+    applyRightPanelWidth(state.rightPanelResize.startWidth + delta);
+    renderCanvasOnly();
+  });
+  const stopResize = () => {
+    if (!state.rightPanelResize) return;
+    state.rightPanelResize = null;
+    document.body.classList.remove("resizing-right");
     render();
   };
   window.addEventListener("pointerup", stopResize);
@@ -526,9 +597,9 @@ function bulkSubmitStateText() {
   const active = activeLovartJobCount();
   if (!bulk.active) return "";
   if (bulk.currentJobId) {
-    return `批量提交中：已投 ${bulk.submitted}/${bulk.total}，待投 ${pending}，Lovart 活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
+    return `批量提交中：已登记 ${bulk.submitted}/${bulk.total}，待登记 ${pending}，Lovart 单通道提交，平台活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
   }
-  return `批量队列：已投 ${bulk.submitted}/${bulk.total}，待投 ${pending}，Lovart 活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
+  return `批量队列：已登记 ${bulk.submitted}/${bulk.total}，待登记 ${pending}，Lovart 单通道提交，平台活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
 }
 
 function resetBulkSubmitQueue() {
@@ -567,6 +638,34 @@ function activeLovartJobCount() {
 
 function rateLimitedJobs() {
   return state.jobs.filter((job) => job.status === "rate_limited" && !job.rate_limit_handled);
+}
+
+function isJimengVipModel(model) {
+  return /_vip$/i.test(String(model || "").trim());
+}
+
+function activeJobsForPlatform(platform = "lovart") {
+  const normalizedPlatform = normalizePlatform(platform);
+  return state.jobs.filter((job) => {
+    if (!["running", "pending_confirmation"].includes(job.status)) return false;
+    if (normalizePlatform(job.platform || "lovart") !== normalizedPlatform) return false;
+    return true;
+  });
+}
+
+function jobBlocksNodeSubmission(job = {}, node = null) {
+  if (job.status !== "rate_limited" || job.rate_limit_handled) return false;
+  const params = generatorParameters(node?.data || {});
+  const jobPlatform = normalizePlatform(job.platform || "lovart");
+  const nodePlatform = normalizePlatform(params.platform || "lovart");
+  if (jobPlatform !== nodePlatform) return false;
+  if (nodePlatform === "jimeng_cli" && isJimengVipModel(params.model)) return false;
+  if (nodePlatform === "jimeng_cli") return activeJobsForPlatform(nodePlatform).length > 0;
+  return true;
+}
+
+function rateLimitedJobsForNode(node) {
+  return rateLimitedJobs().filter((job) => jobBlocksNodeSubmission(job, node));
 }
 
 function hasBulkCapacityForNode(node) {
@@ -626,16 +725,6 @@ async function refreshBulkSubmitState() {
   state.assetLibrary = fresh.asset_library || state.assetLibrary;
 }
 
-async function markRateLimitedJobsHandledSilently(jobs) {
-  for (const job of jobs) {
-    await api("/api/jobs/mark-handled", {
-      method: "POST",
-      body: JSON.stringify({ project_id: state.projectId, job_id: job.job_id }),
-    });
-  }
-  await refreshBulkSubmitState();
-}
-
 async function submitBulkNode(nodeId) {
   const result = await api("/api/jobs/submit", {
     method: "POST",
@@ -665,15 +754,6 @@ async function processBulkSubmitQueue() {
   let submittedThisPass = 0;
   try {
     await refreshBulkSubmitState();
-    if (rateLimitedJobs().length) {
-      if (activeLovartJobCount() >= BULK_SUBMIT_LOVART_ACTIVE_LIMIT || runningJobsForAutoRefresh().length) {
-        setStatus(`批量提交暂停：Lovart 活跃任务较多，等返图后自动继续。${bulkSubmitStateText()}`, "ok");
-        scheduleAutoRefresh();
-        scheduleBulkSubmitRetry(12000);
-        return;
-      }
-      await markRateLimitedJobsHandledSilently(rateLimitedJobs());
-    }
     while (bulk.queue.length) {
       const nodeId = bulk.queue[0];
       const node = state.canvas.nodes.find((item) => item.id === nodeId);
@@ -682,29 +762,16 @@ async function processBulkSubmitQueue() {
         bulk.skipped += 1;
         continue;
       }
-      if (!hasBulkCapacityForNode(node)) {
-        setStatus(`Lovart 已有 ${activeLovartJobCount()} 条活跃任务，批量提交先等返图。${bulkSubmitStateText()}`, "ok");
-        scheduleAutoRefresh();
-        scheduleBulkSubmitRetry(12000);
-        return;
-      }
       bulk.currentNodeId = nodeId;
-      setStatus(`正在批量提交：${nodeTitle(node)}。${bulkSubmitStateText()}`, "ok");
+      setStatus(`正在加入任务队列：${nodeTitle(node)}。${bulkSubmitStateText()}`, "ok");
       const result = await submitBulkNode(nodeId);
       bulk.queue.shift();
       bulk.currentNodeId = null;
       bulk.currentJobId = result.job?.job_id || null;
-      if (result.blocked) {
-        bulk.queue.unshift(nodeId);
-        setStatus(`批量提交遇到并发限制，等返图后自动重试。${bulkSubmitStateText()}`, "ok");
-        scheduleAutoRefresh();
-        scheduleBulkSubmitRetry(12000);
-        return;
-      }
       submittedThisPass += result.ok ? 1 : 0;
     }
     const skippedText = bulk.skipped ? `，跳过 ${bulk.skipped} 条已有任务的节点` : "";
-    const submittedText = bulk.submitted ? `已提交 ${bulk.submitted} 条` : "没有提交新任务";
+    const submittedText = bulk.submitted ? `已加入任务队列 ${bulk.submitted} 条` : "没有提交新任务";
     resetBulkSubmitQueue();
     render();
     setStatus(`批量提交完成：${submittedText}${skippedText}。`, "ok");
@@ -985,14 +1052,19 @@ function escapeRegex(text) {
 
 function aliasMatchRegex(alias) {
   const escaped = escapeRegex(alias);
-  if (/[A-Za-z]/.test(alias)) {
-    return new RegExp(`(^|[^@A-Za-z0-9_])(${escaped})(?=$|[^A-Za-z0-9_])`, "gu");
-  }
-  return new RegExp(escaped, "gu");
+  return new RegExp(`(^|[^@\\p{L}\\p{N}_\\-·])(${escaped})(?=$|[^\\p{L}\\p{N}_\\-·])`, "gu");
+}
+
+function explicitTagAliasRegex(alias) {
+  const escaped = escapeRegex(alias);
+  return new RegExp(`(^|[^@\\p{L}\\p{N}_\\-·])@${escaped}(?=$|[^\\p{L}\\p{N}_\\-·])`, "gu");
 }
 
 function promptContainsAlias(text, alias) {
-  return aliasMatchRegex(alias).test(String(text || ""));
+  const cleanAlias = String(alias || "").replace(/^@/, "").trim();
+  if (!cleanAlias) return false;
+  const source = String(text || "");
+  return explicitTagAliasRegex(cleanAlias).test(source) || aliasMatchRegex(cleanAlias).test(source);
 }
 
 function tagRefsForPrompt(prompt, tags = state.tags) {
@@ -1000,10 +1072,11 @@ function tagRefsForPrompt(prompt, tags = state.tags) {
   const text = String(prompt || "");
   for (const tag of tags || []) {
     const canonical = String(tag.label || "").replace(/^@/, "").trim();
-    const aliases = Array.from(new Set([canonical, ...(tag.aliases || [])].map((item) => String(item || "").trim()).filter(Boolean)));
+    const aliases = Array.from(new Set([canonical, ...(tag.aliases || [])].map((item) => String(item || "").replace(/^@/, "").trim()).filter(Boolean)));
     if (aliases.some((alias) => promptContainsAlias(text, alias))) refs.add(tag.label);
   }
-  return Array.from(refs);
+  const values = Array.from(refs);
+  return values.filter((label) => !values.some((fullLabel) => fullLabel !== label && fullLabel.startsWith(`${label} `)));
 }
 
 function firstAvailableModel(kind, preferred) {
@@ -1990,6 +2063,27 @@ async function updateAssetMeta(assetId, patch) {
   setStatus(`已更新资产标记：${data.asset.name}`, "ok");
 }
 
+async function compressAsset(assetId, options = {}) {
+  const asset = assetById(assetId);
+  if (!asset) return;
+  setStatus(`正在压缩图片：${asset.name}...`);
+  const data = await api("/api/assets/compress", {
+    method: "POST",
+    body: JSON.stringify({
+      project_id: state.projectId,
+      asset_id: assetId,
+      target_mb: options.targetMb || 20,
+      max_edge: options.maxEdge || 2048,
+      quality: options.quality || 82,
+    }),
+  });
+  state.canvas = data.canvas;
+  const before = formatBytes(data.asset?.compression?.before_bytes);
+  const after = formatBytes(data.asset?.compression?.after_bytes);
+  render();
+  setStatus(before && after ? `图片已压缩：${before} → ${after}，绑定关系已保留。` : "图片已压缩，绑定关系已保留。", "ok");
+}
+
 function videoAssetForNode(node) {
   const asset = node?.data?.asset_id ? assetById(node.data.asset_id) : null;
   return asset?.kind === "video" && asset.url ? asset : null;
@@ -2537,7 +2631,7 @@ function renderToolbarState() {
     } else if (selectedGeneratorCount) {
       bulkStatus.textContent = `已选 ${selectedGeneratorCount} 个生成节点`;
     } else {
-      bulkStatus.textContent = activeLovartJobCount() ? `Lovart 活跃 ${activeLovartJobCount()}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}` : "";
+      bulkStatus.textContent = activeLovartJobCount() ? `Lovart 单通道提交，平台活跃 ${activeLovartJobCount()}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}` : "";
     }
   }
 }
@@ -2770,6 +2864,7 @@ function renderAssets() {
         ${asset.url && asset.kind === "image" ? `<img class="asset-preview-thumb" src="${asset.url}" alt="${escapeHtml(asset.name)}">` : ""}
         <input class="asset-name-input" data-rename-asset="${asset.asset_id}" value="${escapeHtml(asset.name)}" aria-label="资产名称">
         <div class="hint">${escapeHtml(asset.kind)} · 节点 ${nodeCountByAsset.get(asset.asset_id) || 0} · 标签 ${boundCountByAsset.get(asset.asset_id) || 0}</div>
+        ${asset.compression?.after_bytes ? `<div class="hint">已压缩：${escapeHtml(formatBytes(asset.compression.before_bytes))} → ${escapeHtml(formatBytes(asset.compression.after_bytes))}</div>` : ""}
         ${asset.is_library_asset ? `<span class="asset-badge">资产 · ${escapeHtml(asset.asset_category || "other")}</span>` : `<span class="hint">未标记为资产</span>`}
         <div class="asset-meta-controls">
           <button data-toggle-library-asset="${asset.asset_id}">${asset.is_library_asset ? "取消资产标记" : "标记为资产"}</button>
@@ -2780,6 +2875,7 @@ function renderAssets() {
       </div>
       <div class="asset-actions">
         <button data-add-asset-node="${asset.asset_id}">放到画布</button>
+        ${asset.kind === "image" && asset.file_path ? `<button data-compress-asset="${asset.asset_id}">压缩图片</button>` : ""}
         <button data-delete-asset="${asset.asset_id}">${state.pendingDeleteAssetId === asset.asset_id ? "确认删除" : "删除资产"}</button>
       </div>
     </div>
@@ -2801,6 +2897,11 @@ function renderAssets() {
       }
       state.pendingDeleteAssetId = null;
       deleteAsset(assetId);
+    });
+  });
+  box.querySelectorAll("[data-compress-asset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      compressAsset(button.dataset.compressAsset).catch((error) => setStatus(`图片压缩失败：${error.message}`, "bad"));
     });
   });
   box.querySelectorAll("[data-toggle-library-asset]").forEach((button) => {
@@ -2936,7 +3037,7 @@ function statusInfoFromJob(job) {
     return { label: "已回复·生成中", tone: "running", job };
   }
   const map = {
-    queued: ["等待", "waiting"],
+    queued: ["待提交", "waiting"],
     running: ["生成中", "running"],
     needs_input: ["待回复", "blocked"],
     pending_confirmation: ["待确认", "blocked"],
@@ -2948,6 +3049,18 @@ function statusInfoFromJob(job) {
   };
   const [label, tone] = map[job.status] || [job.status || "未知", "waiting"];
   return { label, tone, job };
+}
+
+function jobFailureReason(job) {
+  const reason = String(job?.failure_reason || "");
+  if (!/已在 Lovart 平台处理|并发限制已在 Lovart 平台处理/.test(reason)) return reason;
+  if (job?.platform === "jimeng_cli") return "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
+  if (job?.platform === "lovart") return "Lovart 并发限制已标记为处理完成，可重新提交任务。";
+  return "当前平台并发限制已标记为处理完成，可重新提交任务。";
+}
+
+function canManuallyResolveRateLimit(job = {}) {
+  return job.status === "rate_limited" && job.platform !== "jimeng_cli";
 }
 
 function jobNeedsLovartReply(job) {
@@ -3012,6 +3125,24 @@ function shotStatusSummary() {
   return summary;
 }
 
+function scriptBindingForShot(shotId) {
+  return (state.script.bindings || []).find((binding) => String(binding.shot_id) === String(shotId));
+}
+
+function scriptSegmentById(segmentId) {
+  return (state.script.segments || []).find((segment) => segment.segment_id === segmentId);
+}
+
+function scriptSegmentForShot(shotId) {
+  const binding = scriptBindingForShot(shotId);
+  return binding ? scriptSegmentById(binding.segment_id) : null;
+}
+
+function scriptSegmentPreview(text, max = 90) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  return clean.length > max ? `${clean.slice(0, max)}...` : clean;
+}
+
 function renderShotTable() {
   const box = $("#shotTable");
   if (!state.shots.length) {
@@ -3035,6 +3166,7 @@ function renderShotTable() {
   ` + state.shots.map((shot, index) => {
     const imageStatus = shotPartStatus(shot, "image");
     const videoStatus = shotPartStatus(shot, "video");
+    const scriptSegment = scriptSegmentForShot(shot.shot_id);
     return `
     <details class="shot-card" data-shot-detail="${escapeHtml(shot.shot_id)}" ${state.openShotIds.includes(shot.shot_id) ? "open" : ""}>
       <summary>
@@ -3080,10 +3212,12 @@ function renderShotTable() {
       </details>
       <label class="field"><span>图片提示词</span><textarea class="shot-prompt-textarea" data-shot-index="${index}" data-shot-field="image_prompt">${escapeHtml(shot.image_prompt || "")}</textarea></label>
       <label class="field"><span>视频提示词</span><textarea class="shot-prompt-textarea" data-shot-index="${index}" data-shot-field="video_prompt">${escapeHtml(shot.video_prompt || "")}</textarea></label>
+      ${scriptSegment ? `<div class="script-shot-link"><strong>剧本段落</strong><span>${escapeHtml(scriptSegmentPreview(scriptSegment.text))}</span></div>` : ""}
       <div class="hint">标签：${escapeHtml((shot.tag_refs || []).join(", ") || "无")}</div>
       <div class="shot-actions">
         <button data-copy-shot="${index}" data-copy-field="image_prompt">复制图片词</button>
         <button data-copy-shot="${index}" data-copy-field="video_prompt">复制视频词</button>
+        <button class="wide-action" data-optimize-shot="${index}">提示词优化</button>
         <button data-create-shot-nodes="${index}">${escapeHtml(workflowPreset().applySingleLabel)}</button>
       </div>
     </details>
@@ -3144,6 +3278,12 @@ function renderShotTable() {
     });
   });
 
+  box.querySelectorAll("[data-optimize-shot]").forEach((button) => {
+    button.addEventListener("click", () => {
+      openPromptOptimizer({ type: "shot", index: Number(button.dataset.optimizeShot) });
+    });
+  });
+
   box.querySelectorAll("[data-create-shot-nodes]").forEach((button) => {
     button.addEventListener("click", async () => {
       await safeCreateShotNodes([Number(button.dataset.createShotNodes)]);
@@ -3168,6 +3308,158 @@ function renderWorkflowList() {
     </article>
   `;
   $("#applyDefaultWorkflow")?.addEventListener("click", () => safeCreateShotNodes([], workflow.id));
+}
+
+function normalizeScriptForState(script = {}) {
+  return {
+    source_text: String(script.source_text || ""),
+    segments: Array.isArray(script.segments) ? script.segments : [],
+    bindings: Array.isArray(script.bindings) ? script.bindings : [],
+    updated_at: script.updated_at || "",
+  };
+}
+
+function rememberScriptSelection() {
+  const textarea = $("#scriptSourceText");
+  if (!textarea) return;
+  const start = textarea.selectionStart || 0;
+  const end = textarea.selectionEnd || 0;
+  const selected = textarea.value.slice(start, end).trim();
+  if (!selected) return;
+  state.scriptSelection = { text: selected, start, end };
+  const status = $("#scriptStatus");
+  if (status) status.textContent = `已选中 ${selected.length} 字，可以搜索分镜后绑定。`;
+}
+
+function scriptSelectionText() {
+  const textarea = $("#scriptSourceText");
+  if (!textarea) return "";
+  const selected = textarea.value.slice(textarea.selectionStart || 0, textarea.selectionEnd || 0).trim();
+  return selected || state.scriptSelection.text || "";
+}
+
+function shotPreviewText(shot) {
+  return [
+    `分镜 ${shot.shot_id}`,
+    shot.image_prompt || "",
+    shot.video_prompt || "",
+    (shot.tag_refs || []).join(" "),
+  ].join(" ").toLowerCase();
+}
+
+function renderScriptPanel() {
+  const textarea = $("#scriptSourceText");
+  const select = $("#scriptBindShot");
+  const list = $("#scriptSegmentList");
+  const search = $("#scriptShotSearch");
+  const previewList = $("#scriptShotPreviewList");
+  if (!textarea || !select || !list) return;
+  if (document.activeElement !== textarea && document.activeElement !== search) textarea.value = state.script.source_text || "";
+  const previousShotId = select.value;
+  select.innerHTML = state.shots.length
+    ? state.shots.map((shot) => `<option value="${escapeHtml(shot.shot_id)}">分镜 ${escapeHtml(shot.shot_id)}</option>`).join("")
+    : `<option value="">先导入分镜</option>`;
+  if (previousShotId && state.shots.some((shot) => String(shot.shot_id) === String(previousShotId))) {
+    select.value = previousShotId;
+  }
+  if (previewList) {
+    const query = String(search?.value || "").trim().toLowerCase();
+    const matches = state.shots
+      .filter((shot) => !query || shotPreviewText(shot).includes(query))
+      .slice(0, 16);
+    previewList.innerHTML = matches.length
+      ? matches.map((shot) => {
+          const segment = scriptSegmentForShot(shot.shot_id);
+          return `
+            <article class="script-shot-preview-card">
+              <div class="script-shot-preview-head">
+                <strong>分镜 ${escapeHtml(shot.shot_id)}</strong>
+                ${segment ? `<span>已绑定</span>` : ""}
+              </div>
+              ${shot.image_prompt ? `<p><b>图</b>${escapeHtml(scriptSegmentPreview(shot.image_prompt, 92))}</p>` : ""}
+              ${shot.video_prompt ? `<p><b>视频</b>${escapeHtml(scriptSegmentPreview(shot.video_prompt, 140))}</p>` : ""}
+              <button data-bind-script-shot="${escapeHtml(shot.shot_id)}">绑定到这镜</button>
+            </article>
+          `;
+        }).join("")
+      : `<p class="hint">没有匹配的分镜，换个词试试。</p>`;
+    previewList.querySelectorAll("[data-bind-script-shot]").forEach((button) => {
+      button.addEventListener("click", () => {
+        select.value = button.dataset.bindScriptShot;
+        bindSelectedScriptSegment(button.dataset.bindScriptShot).catch((error) => setStatus(`剧本绑定失败：${error.message}`, "bad"));
+      });
+    });
+  }
+  list.innerHTML = (state.script.bindings || []).length
+    ? (state.script.bindings || []).map((binding) => {
+        const segment = scriptSegmentById(binding.segment_id);
+        if (!segment) return "";
+        return `
+          <article class="script-segment-card">
+            <strong>分镜 ${escapeHtml(binding.shot_id)}</strong>
+            <p>${escapeHtml(scriptSegmentPreview(segment.text, 140))}</p>
+            <button data-unbind-script="${escapeHtml(binding.shot_id)}">取消绑定</button>
+          </article>
+        `;
+      }).join("")
+    : `<p class="hint">还没有绑定剧本段落。</p>`;
+  list.querySelectorAll("[data-unbind-script]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const shotId = button.dataset.unbindScript;
+      state.script.bindings = (state.script.bindings || []).filter((binding) => binding.shot_id !== shotId);
+      saveScript().catch((error) => setStatus(`剧本保存失败：${error.message}`, "bad"));
+    });
+  });
+}
+
+async function saveScript() {
+  const textarea = $("#scriptSourceText");
+  if (textarea) state.script.source_text = textarea.value;
+  const data = await api("/api/script/save", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, script: state.script }),
+  });
+  state.script = normalizeScriptForState(data.script || {});
+  renderScriptPanel();
+  renderShotTable();
+  setStatus("剧本已保存。", "ok");
+}
+
+async function importScriptFile(file) {
+  const text = await file.text();
+  state.script.source_text = text;
+  $("#scriptSourceText").value = text;
+  await saveScript();
+  $("#scriptStatus").textContent = `已导入 ${file.name}。`;
+}
+
+async function bindSelectedScriptSegment(shotIdOverride = "") {
+  const textarea = $("#scriptSourceText");
+  const shotId = shotIdOverride || $("#scriptBindShot")?.value || "";
+  if (!textarea) return;
+  if (!shotId) return setStatus("先选择要绑定的分镜。", "bad");
+  const selected = scriptSelectionText();
+  if (!selected) return setStatus("先在剧本文本里选中一小段。", "bad");
+  state.script.source_text = textarea.value;
+  const existingBinding = scriptBindingForShot(shotId);
+  const segmentId = existingBinding?.segment_id || uid("scriptseg");
+  const previousSegments = (state.script.segments || []).filter((segment) => segment.segment_id !== segmentId);
+  state.script.segments = [
+    ...previousSegments,
+    {
+      segment_id: segmentId,
+      title: `分镜 ${shotId}`,
+      text: selected,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+  ];
+  state.script.bindings = [
+    ...(state.script.bindings || []).filter((binding) => binding.shot_id !== shotId),
+    { shot_id: shotId, segment_id: segmentId, updated_at: new Date().toISOString() },
+  ];
+  await saveScript();
+  $("#scriptStatus").textContent = `已绑定到分镜 ${shotId}。`;
 }
 
 function rebuildTagsFromShots(previousTags = state.tags) {
@@ -3226,6 +3518,393 @@ async function saveShotsAndTagsFromTable(options = {}) {
   if (!silent) setStatus("分镜表和标签已保存。", "ok");
 }
 
+function shotById(shotId) {
+  return state.shots.find((shot) => String(shot.shot_id) === String(shotId));
+}
+
+function normalizePromptContextForState(context = {}) {
+  const presets = Array.isArray(context.feedback_presets)
+    ? context.feedback_presets.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  return {
+    ...context,
+    learnings: Array.isArray(context.learnings) ? context.learnings : [],
+    feedback_presets: presets.length ? Array.from(new Set(presets)) : [...DEFAULT_PROMPT_FEEDBACK_PRESETS],
+    revisions: Array.isArray(context.revisions) ? context.revisions : [],
+  };
+}
+
+function promptFeedbackPresets() {
+  const presets = Array.isArray(state.promptContext?.feedback_presets) ? state.promptContext.feedback_presets : [];
+  return presets.length ? presets : DEFAULT_PROMPT_FEEDBACK_PRESETS;
+}
+
+function appendPromptFeedback(text) {
+  const input = $("#promptOptimizerFeedback");
+  if (!input) return;
+  const value = String(text || "").trim();
+  if (!value) return;
+  const current = input.value.trim();
+  const parts = current ? current.split(/\n+/).map((item) => item.trim()).filter(Boolean) : [];
+  if (!parts.includes(value)) parts.push(value);
+  input.value = parts.join("\n");
+  input.focus();
+}
+
+async function savePromptFeedbackPresets(presets) {
+  const cleaned = Array.from(new Set((presets || []).map((item) => String(item || "").trim()).filter(Boolean))).slice(0, 30);
+  const data = await api("/api/prompt-context", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, feedback_presets: cleaned }),
+  });
+  state.promptContext = normalizePromptContextForState(data.prompt_context || {});
+  renderPromptFeedbackPresets();
+  setStatus("快捷反馈已保存到当前项目。", "ok");
+}
+
+function renderPromptFeedbackPresets() {
+  const presetBox = $("#promptFeedbackPresets");
+  const manageBox = $("#promptFeedbackPresetManage");
+  if (!presetBox || !manageBox) return;
+  const presets = promptFeedbackPresets();
+  presetBox.innerHTML = presets
+    .map((item) => `<button type="button" data-feedback-preset="${escapeHtml(item)}">${escapeHtml(item)}</button>`)
+    .join("");
+  manageBox.innerHTML = presets
+    .map((item) => `<button type="button" data-remove-feedback-preset="${escapeHtml(item)}">${escapeHtml(item)} ×</button>`)
+    .join("");
+  presetBox.querySelectorAll("[data-feedback-preset]").forEach((button) => {
+    button.addEventListener("click", () => appendPromptFeedback(button.dataset.feedbackPreset));
+  });
+  manageBox.querySelectorAll("[data-remove-feedback-preset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const next = promptFeedbackPresets().filter((item) => item !== button.dataset.removeFeedbackPreset);
+      savePromptFeedbackPresets(next).catch((error) => setStatus(`快捷反馈保存失败：${error.message}`, "bad"));
+    });
+  });
+}
+
+function setPromptFeedbackConfigOpen(open) {
+  const panel = $("#promptFeedbackConfigPanel");
+  const button = $("#togglePromptFeedbackConfig");
+  if (!panel || !button) return;
+  panel.hidden = !open;
+  button.textContent = open ? "收起快捷反馈管理" : "管理快捷反馈";
+}
+
+function togglePromptFeedbackConfig() {
+  const panel = $("#promptFeedbackConfigPanel");
+  setPromptFeedbackConfigOpen(Boolean(panel?.hidden));
+}
+
+async function addPromptFeedbackPreset() {
+  const input = $("#promptFeedbackPresetInput");
+  const value = String(input?.value || "").trim();
+  if (!value) return setStatus("先输入一个快捷反馈。", "bad");
+  const next = [...promptFeedbackPresets(), value];
+  if (input) input.value = "";
+  await savePromptFeedbackPresets(next);
+}
+
+async function resetPromptFeedbackPresets() {
+  await savePromptFeedbackPresets(DEFAULT_PROMPT_FEEDBACK_PRESETS);
+}
+
+function promptOptimizerTargetData(target = state.promptOptimizer.target) {
+  if (!target) return null;
+  if (target.type === "shot") {
+    const shot = state.shots[target.index];
+    if (!shot) return null;
+    return {
+      target,
+      label: `分镜 ${shot.shot_id}`,
+      shot,
+      image_prompt: shot.image_prompt || "",
+      video_prompt: shot.video_prompt || "",
+      script_segment: scriptSegmentForShot(shot.shot_id),
+      applyFields: ["image", "video"],
+    };
+  }
+  if (target.type === "node") {
+    const node = state.canvas.nodes.find((item) => item.id === target.nodeId);
+    if (!node || !["imageGen", "videoGen"].includes(node.type)) return null;
+    const shot = node.data?.shot_id ? shotById(node.data.shot_id) : null;
+    const isImage = node.type === "imageGen";
+    return {
+      target,
+      label: node.data?.shot_id ? `分镜 ${node.data.shot_id} ${isImage ? "图片节点" : "视频节点"}` : nodeTitle(node),
+      node,
+      shot,
+      image_prompt: isImage ? (node.data?.prompt || "") : (shot?.image_prompt || ""),
+      video_prompt: isImage ? (shot?.video_prompt || "") : (node.data?.prompt || ""),
+      script_segment: shot ? scriptSegmentForShot(shot.shot_id) : null,
+      applyFields: [isImage ? "image" : "video"],
+    };
+  }
+  return null;
+}
+
+function boundAssetsForShot(shot) {
+  const assetIds = new Set();
+  const tagLabels = new Map();
+  for (const label of shot?.tag_refs || []) {
+    const tag = state.tags.find((item) => item.label === label);
+    for (const assetId of tag?.bound_asset_ids || []) {
+      assetIds.add(assetId);
+      if (!tagLabels.has(assetId)) tagLabels.set(assetId, []);
+      tagLabels.get(assetId).push(label);
+    }
+  }
+  return Array.from(assetIds).map((assetId) => {
+    const asset = assetById(assetId);
+    if (!asset) return null;
+    return {
+      asset_id: asset.asset_id,
+      name: asset.name,
+      kind: asset.kind,
+      category: asset.asset_category || "",
+      is_library_asset: Boolean(asset.is_library_asset),
+      tag_labels: tagLabels.get(assetId) || [],
+      source: asset.file_path ? "local" : asset.external_url ? "url" : asset.source || "",
+    };
+  }).filter(Boolean);
+}
+
+function openPromptOptimizer(target) {
+  const current = promptOptimizerTargetData(target);
+  if (!current) {
+    setStatus("先选择一个分镜或生成节点。", "bad");
+    return;
+  }
+  state.promptOptimizer = {
+    target,
+    feedback: "",
+    result: null,
+    loading: false,
+  };
+  $("#promptOptimizerTitle").textContent = `提示词优化 · ${current.label}`;
+  $("#promptOptimizerFeedback").value = "";
+  $("#promptOptimizerStatus").textContent = "";
+  $("#promptOptimizerDiff").hidden = true;
+  $("#promptOptimizerDiff").innerHTML = "";
+  $("#promptFeedbackPresetInput").value = "";
+  renderPromptFeedbackPresets();
+  setPromptFeedbackConfigOpen(false);
+  setPromptOptimizerApplyButtons(false);
+  $("#promptOptimizerModal").hidden = false;
+}
+
+function closePromptOptimizer() {
+  $("#promptOptimizerModal").hidden = true;
+}
+
+function setPromptOptimizerApplyButtons(enabled) {
+  const current = promptOptimizerTargetData();
+  const fields = new Set(current?.applyFields || []);
+  $("#applyPromptImage").disabled = !enabled || !fields.has("image");
+  $("#applyPromptVideo").disabled = !enabled || !fields.has("video");
+  $("#applyPromptBoth").disabled = !enabled;
+  if (current?.target?.type === "node") {
+    $("#applyPromptBoth").textContent = fields.has("image") ? "应用到图片节点" : "应用到视频节点";
+  } else {
+    $("#applyPromptBoth").textContent = "应用到当前分镜";
+  }
+}
+
+function renderPromptOptimizerResult() {
+  const box = $("#promptOptimizerDiff");
+  const result = state.promptOptimizer.result;
+  const current = promptOptimizerTargetData();
+  if (!box || !result || !current) return;
+  const suggestions = result.project_learning_suggestions || [];
+  const warnings = result.warnings || [];
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="prompt-diff-grid">
+      <div class="prompt-diff-card">
+        <strong>原图片词</strong>
+        <textarea readonly>${escapeHtml(current.image_prompt || "")}</textarea>
+      </div>
+      <div class="prompt-diff-card">
+        <strong>新图片词</strong>
+        <textarea id="revisedImagePrompt">${escapeHtml(result.revised_image_prompt || "")}</textarea>
+      </div>
+      <div class="prompt-diff-card">
+        <strong>原视频词</strong>
+        <textarea readonly>${escapeHtml(current.video_prompt || "")}</textarea>
+      </div>
+      <div class="prompt-diff-card">
+        <strong>新视频词</strong>
+        <textarea id="revisedVideoPrompt">${escapeHtml(result.revised_video_prompt || "")}</textarea>
+      </div>
+    </div>
+    <div class="prompt-diff-card">
+      <strong>修改原因</strong>
+      <div class="hint">${escapeHtml(result.change_summary || "")}</div>
+    </div>
+    ${warnings.length ? `
+      <div class="prompt-diff-card">
+        <strong>风险提醒</strong>
+        <div class="prompt-warning-list">${warnings.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}</div>
+      </div>
+    ` : ""}
+    ${suggestions.length ? `
+      <div class="prompt-diff-card">
+        <strong>可记住的项目经验</strong>
+        <div class="prompt-learning-list">
+          ${suggestions.map((item, index) => `
+            <div class="prompt-learning-item">
+              <span>${escapeHtml(item)}</span>
+              <button data-remember-learning="${index}">记住</button>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    ` : ""}
+  `;
+  box.querySelectorAll("[data-remember-learning]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const learning = suggestions[Number(button.dataset.rememberLearning)];
+      if (!learning) return;
+      await api("/api/prompt-context", {
+        method: "POST",
+        body: JSON.stringify({ project_id: state.projectId, learning }),
+      });
+      button.textContent = "已记住";
+      button.disabled = true;
+      setStatus("项目经验已记住，下次优化会带上。", "ok");
+    });
+  });
+  setPromptOptimizerApplyButtons(true);
+}
+
+async function runPromptOptimizer() {
+  const current = promptOptimizerTargetData();
+  if (!current) return setStatus("先选择一个分镜或生成节点。", "bad");
+  const feedback = $("#promptOptimizerFeedback").value.trim();
+  if (!feedback) {
+    $("#promptOptimizerStatus").textContent = "先写一句这次哪里不理想。";
+    return;
+  }
+  state.promptOptimizer.feedback = feedback;
+  state.promptOptimizer.loading = true;
+  state.promptOptimizer.result = null;
+  $("#promptOptimizerStatus").textContent = "正在整理优化建议...";
+  $("#promptOptimizerDiff").hidden = true;
+  setPromptOptimizerApplyButtons(false);
+  const shot = current.shot || {};
+  const params = current.node ? generatorParameters(current.node.data || {}) : {};
+  try {
+    const data = await api("/api/prompt-optimize", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: state.projectId,
+        node_id: current.node?.id || "",
+        shot_id: shot.shot_id || "",
+        transition: shot.transition || current.node?.data?.transition || "",
+        platform: current.node?.data?.platform || shot.platform || "",
+        model: params.model || shot.video_model || "",
+        mode: params.mode || "",
+        duration: params.duration || shot.duration || "",
+        size: params.size || shot.size || "",
+        image_prompt: current.image_prompt,
+        video_prompt: current.video_prompt,
+        tag_refs: shot.tag_refs || tagRefsForPrompt([current.image_prompt, current.video_prompt].filter(Boolean).join("\n\n")),
+        bound_assets: boundAssetsForShot(shot),
+        script_segment: current.script_segment
+          ? {
+              segment_id: current.script_segment.segment_id,
+              title: current.script_segment.title || "",
+              text: current.script_segment.text || "",
+            }
+          : null,
+        user_feedback: feedback,
+      }),
+    });
+    state.promptOptimizer.result = data.result;
+    $("#promptOptimizerStatus").textContent = "建议已生成，确认差异后再应用。";
+    renderPromptOptimizerResult();
+  } catch (error) {
+    $("#promptOptimizerStatus").textContent = promptOptimizerErrorMessage(error);
+    if (/DeepSeek|Key/i.test(error.message || "")) {
+      ensureLeftSectionExpanded("deepseek-config");
+      scrollToLeftSection("deepseek-config");
+    }
+  } finally {
+    state.promptOptimizer.loading = false;
+  }
+}
+
+function promptOptimizerErrorMessage(error) {
+  const message = String(error?.message || "").trim();
+  if (!message) return "优化失败，可以重试或手动修改。";
+  if (/<\s*html[\s>]|301 Moved Permanently|openresty/i.test(message)) {
+    return "DeepSeek 地址返回了网页跳转页。请把 Base URL 改为 https://api.deepseek.com 后重试。";
+  }
+  return message.length > 240 ? `${message.slice(0, 240)}...` : message;
+}
+
+function revisedPromptValues() {
+  return {
+    image: $("#revisedImagePrompt")?.value ?? state.promptOptimizer.result?.revised_image_prompt ?? "",
+    video: $("#revisedVideoPrompt")?.value ?? state.promptOptimizer.result?.revised_video_prompt ?? "",
+  };
+}
+
+async function recordPromptRevision(appliedFields, values) {
+  const current = promptOptimizerTargetData();
+  if (!current || !state.promptOptimizer.result) return;
+  const data = await api("/api/prompt-context", {
+    method: "POST",
+    body: JSON.stringify({
+      project_id: state.projectId,
+      revision: {
+        target_label: current.label || "",
+        shot_id: current.shot?.shot_id || "",
+        node_id: current.node?.id || "",
+        feedback: state.promptOptimizer.feedback || "",
+        original_image_prompt: current.image_prompt || "",
+        revised_image_prompt: values.image || "",
+        original_video_prompt: current.video_prompt || "",
+        revised_video_prompt: values.video || "",
+        change_summary: state.promptOptimizer.result.change_summary || "",
+        warnings: state.promptOptimizer.result.warnings || [],
+        applied_fields: appliedFields,
+        script_segment_title: current.script_segment?.title || "",
+        script_segment_text: current.script_segment?.text || "",
+      },
+    }),
+  });
+  state.promptContext = normalizePromptContextForState(data.prompt_context || {});
+  renderReview();
+}
+
+async function applyPromptOptimization(fields) {
+  const current = promptOptimizerTargetData();
+  if (!current || !state.promptOptimizer.result) return;
+  const values = revisedPromptValues();
+  const allowed = new Set(current.applyFields);
+  const appliedFields = fields.filter((field) => allowed.has(field));
+  if (!appliedFields.length) return;
+  if (current.target.type === "shot") {
+    const shot = state.shots[current.target.index];
+    if (!shot) return;
+    await recordPromptRevision(appliedFields, values);
+    if (appliedFields.includes("image")) shot.image_prompt = values.image;
+    if (appliedFields.includes("video")) shot.video_prompt = values.video;
+    await saveShotsAndTagsFromTable({ silent: true });
+    setStatus("已应用优化结果到当前分镜。", "ok");
+  } else if (current.target.type === "node") {
+    const node = state.canvas.nodes.find((item) => item.id === current.target.nodeId);
+    if (!node) return;
+    await recordPromptRevision(appliedFields, values);
+    patchNodeData(node.id, { prompt: node.type === "imageGen" ? values.image : values.video });
+    render();
+    setStatus("已应用优化结果到当前节点。", "ok");
+  }
+  closePromptOptimizer();
+}
+
 function normalizeInlineTagSpacing(text) {
   return String(text || "")
     .replace(/@([A-Za-z][A-Za-z0-9_\-·]*)(?=[\p{Script=Han}])/gu, "@$1 ")
@@ -3243,7 +3922,8 @@ function collapseBrokenAsciiTags(text) {
 function replaceAliasesWithTag(text, aliases, label) {
   const canonical = String(label || "").replace(/^@/, "").trim() || label;
   let next = String(text || "");
-  for (const alias of [...new Set(aliases.filter(Boolean))].sort((a, b) => b.length - a.length)) {
+  const normalizedAliases = aliases.map((alias) => String(alias || "").replace(/^@/, "").trim()).filter(Boolean);
+  for (const alias of [...new Set(normalizedAliases)].sort((a, b) => b.length - a.length)) {
     next = next.replace(aliasMatchRegex(alias), (...args) => {
       const match = args[0];
       const source = args[args.length - 1];
@@ -3527,6 +4207,9 @@ function renderInspector() {
   const submitButton = isGenerator
     ? `<button class="primary" id="submitGeneration">${state.pendingForceSubmitNodeId === node.id ? "仍然提交一条" : "提交生成任务"}</button><div id="submitFeedback" class="inline-feedback"></div>`
     : "";
+  const optimizerButton = isGenerator
+    ? `<button id="openNodePromptOptimizer">提示词优化</button>`
+    : "";
   const videoTools = videoAsset
     ? `<button id="openVideoPreview">放大预览</button><button id="captureLastFrame">提取静帧</button>`
     : "";
@@ -3561,6 +4244,12 @@ function renderInspector() {
         ${["character", "scene", "prop", "other"].map((category) => `<option value="${category}" ${String(asset.asset_category || "other") === category ? "selected" : ""}>${category}</option>`).join("")}
       </select>
     </label>
+    ${asset.kind === "image" && asset.file_path ? `
+      <div class="asset-compress-box">
+        <button id="compressInspectorAsset">压缩图片到 20MB 内</button>
+        <div class="hint">${asset.compression?.after_bytes ? `当前压缩后约 ${escapeHtml(formatBytes(asset.compression.after_bytes))}` : "会保留绑定关系，原图不会删除。"}</div>
+      </div>
+    ` : ""}
   ` : "";
   const shotMeta = node.data.transition
     ? `<div class="hint">工作流：${escapeHtml(node.data.workflow_label || workflowPreset().label)} · 平台：${escapeHtml(platformLabel(node.data.platform))} · 衔接方式：${escapeHtml(transitionLabel(node.data.transition))}${node.data.expected_prev_shot_id ? ` · 上一分镜 ${escapeHtml(node.data.expected_prev_shot_id)}` : ""}</div>`
@@ -3575,6 +4264,7 @@ function renderInspector() {
     ${shotMeta}
     ${memoMeta}
     ${promptField}
+    ${optimizerButton}
     ${memoField}
     ${generatorSummary}
     ${submitButton}
@@ -3673,10 +4363,14 @@ function renderInspector() {
       asset_category: inspectorCategory.value,
     }));
   }
+  $("#compressInspectorAsset")?.addEventListener("click", () => {
+    if (asset) compressAsset(asset.asset_id).catch((error) => setStatus(`图片压缩失败：${error.message}`, "bad"));
+  });
   const deleteAssetButton = $("#deleteAssetFromNode");
   if (deleteAssetButton) deleteAssetButton.addEventListener("click", () => deleteAsset(node.data.asset_id));
   const submit = $("#submitGeneration");
   if (submit) submit.addEventListener("click", () => submitGeneration(node.id, submit));
+  $("#openNodePromptOptimizer")?.addEventListener("click", () => openPromptOptimizer({ type: "node", nodeId: node.id }));
 }
 
 function renderGeneratorFields(node) {
@@ -4044,7 +4738,7 @@ function renderJobs() {
       </summary>
       <div class="job-detail">
         <div class="job-primary-actions">
-          ${job.status === "rate_limited" ? `<button data-mark-handled-job="${job.job_id}">已在平台处理</button>` : ""}
+          ${canManuallyResolveRateLimit(job) ? `<button data-mark-handled-job="${job.job_id}">解除并发阻塞</button>` : ""}
           ${job.status === "pending_confirmation" ? `<button data-confirm-job="${job.job_id}">确认并继续</button>` : ""}
           ${((job.lovart_thread_id || job.jimeng_submit_id) && job.status !== "downloaded") ? `<button data-refresh-job="${job.job_id}">刷新结果</button>` : ""}
         </div>
@@ -4081,7 +4775,7 @@ function renderJobs() {
         ${job.lovart_project_id ? `<div>Lovart 项目：${escapeHtml(job.lovart_project_id)}</div>` : ""}
         ${job.lovart_thread_id ? `<div>Thread：${escapeHtml(job.lovart_thread_id)}</div>` : ""}
         ${job.jimeng_submit_id ? `<div>Submit ID：${escapeHtml(job.jimeng_submit_id)}</div>` : ""}
-        ${job.failure_reason ? `<div class="bad">${escapeHtml(job.failure_reason)}</div>` : ""}
+        ${jobFailureReason(job) ? `<div class="bad">${escapeHtml(jobFailureReason(job))}</div>` : ""}
       </div>
     </details>
   `;
@@ -4112,11 +4806,27 @@ function renderReview() {
   const box = $("#reviewList");
   if (!box) return;
   const memoNodes = state.canvas.nodes.filter((node) => node.type === "memo");
-  if (!memoNodes.length) {
+  const promptRevisions = Array.isArray(state.promptContext?.revisions)
+    ? [...state.promptContext.revisions].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+    : [];
+  if (!memoNodes.length && !promptRevisions.length) {
     box.innerHTML = `<p class="hint">还没有项目复盘。先添加一个备忘录节点，再把它和相关节点连起来。</p>`;
     return;
   }
-  box.innerHTML = memoNodes.map((memoNode) => {
+  const promptRevisionHtml = promptRevisions.length ? `
+    <details class="review-card" open>
+      <summary>
+        <strong>提示词优化记录</strong>
+        <span class="hint">${promptRevisions.length} 条</span>
+      </summary>
+      <div class="review-body">
+        <div class="review-prompt-record-list">
+          ${promptRevisions.map(renderPromptRevisionReviewCard).join("")}
+        </div>
+      </div>
+    </details>
+  ` : "";
+  const memoHtml = memoNodes.map((memoNode) => {
     const linked = memoLinkedNodes(memoNode);
     const linkedMedia = linked.filter((node) => {
       const asset = node.data?.asset_id ? assetById(node.data.asset_id) : null;
@@ -4155,6 +4865,71 @@ function renderReview() {
       </details>
     `;
   }).join("");
+  box.innerHTML = promptRevisionHtml + memoHtml;
+}
+
+function promptRevisionFieldLabel(field) {
+  return field === "image" ? "图片提示词" : field === "video" ? "视频提示词" : field;
+}
+
+function renderPromptRevisionPromptPair(revision, field) {
+  const original = field === "image" ? revision.original_image_prompt : revision.original_video_prompt;
+  const revised = field === "image" ? revision.revised_image_prompt : revision.revised_video_prompt;
+  return `
+    <div class="review-prompt-diff-card">
+      <strong>原${escapeHtml(promptRevisionFieldLabel(field))}</strong>
+      <textarea class="review-detail-text" readonly>${escapeHtml(original || "无")}</textarea>
+    </div>
+    <div class="review-prompt-diff-card">
+      <strong>实际替换为</strong>
+      <textarea class="review-detail-text" readonly>${escapeHtml(revised || "无")}</textarea>
+    </div>
+  `;
+}
+
+function renderPromptRevisionReviewCard(revision) {
+  const fields = Array.isArray(revision.applied_fields) && revision.applied_fields.length
+    ? revision.applied_fields
+    : ["image", "video"].filter((field) => revision[`revised_${field}_prompt`]);
+  const warnings = Array.isArray(revision.warnings) ? revision.warnings : [];
+  return `
+    <article class="review-prompt-card">
+      <div class="review-linked-head">
+        <strong>${escapeHtml(revision.target_label || (revision.shot_id ? `分镜 ${revision.shot_id}` : revision.node_id || "提示词优化"))}</strong>
+        <span class="hint">${escapeHtml(formatTimeLabel(revision.created_at))}</span>
+      </div>
+      <div class="review-prompt-meta">
+        ${revision.shot_id ? `<span>分镜 ${escapeHtml(revision.shot_id)}</span>` : ""}
+        ${revision.node_id ? `<span>节点 ${escapeHtml(revision.node_id)}</span>` : ""}
+        ${fields.length ? `<span>已应用：${escapeHtml(fields.map(promptRevisionFieldLabel).join("、"))}</span>` : ""}
+      </div>
+      <div class="review-section">
+        <strong>我的修改要求</strong>
+        <div class="review-note">${escapeHtml(revision.feedback || "无")}</div>
+      </div>
+      ${revision.script_segment_text ? `
+        <div class="review-section">
+          <strong>绑定剧本段落</strong>
+          <div class="review-note">${escapeHtml(scriptSegmentPreview(revision.script_segment_text, 260))}</div>
+        </div>
+      ` : ""}
+      <div class="review-prompt-diff-grid">
+        ${fields.map((field) => renderPromptRevisionPromptPair(revision, field)).join("")}
+      </div>
+      ${revision.change_summary ? `
+        <div class="review-section">
+          <strong>修改原因</strong>
+          <div class="hint">${escapeHtml(revision.change_summary)}</div>
+        </div>
+      ` : ""}
+      ${warnings.length ? `
+        <div class="review-section">
+          <strong>风险提醒</strong>
+          <div class="prompt-warning-list">${warnings.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}</div>
+        </div>
+      ` : ""}
+    </article>
+  `;
 }
 
 function renderRightPanels() {
@@ -4192,6 +4967,7 @@ function render() {
   renderTags();
   renderAssets();
   renderWorkflowList();
+  renderScriptPanel();
   renderShotTable();
   renderInspector();
   renderJobs();
@@ -4254,6 +5030,8 @@ async function loadProject(name = state.projectId) {
   state.tags = rebuildTagsFromShots(data.tags || []);
   state.jobs = data.jobs;
   state.assetLibrary = data.asset_library || { global_rules: "", templates: [], image_model: "agent-auto" };
+  state.promptContext = normalizePromptContextForState(data.prompt_context || {});
+  state.script = normalizeScriptForState(data.script || {});
   const draft = readCanvasDraft(state.projectId);
   if (draft?.canvas) {
     state.canvas = mergeCanvasDraftWithServer(draft.canvas, state.canvas);
@@ -4349,6 +5127,17 @@ async function loadSettings() {
   const pythonText = state.settings.python_command ? `Python：${state.settings.python_command}` : "";
   status.textContent = [keyText, skillText, pythonText].filter(Boolean).join(" | ");
   status.className = `hint ${keyReady && skillReady ? "ok" : "bad"}`;
+
+  const deepseek = state.settings.deepseek || {};
+  $("#deepseekEnabled").checked = Boolean(deepseek.enabled);
+  $("#deepseekBaseUrl").value = deepseek.base_url || "https://api.deepseek.com";
+  $("#deepseekModel").value = deepseek.model || "deepseek-chat";
+  const deepseekStatus = $("#deepseekStatus");
+  const deepseekReady = Boolean(deepseek.enabled && deepseek.api_key_set);
+  deepseekStatus.textContent = deepseek.api_key_set
+    ? `已保存：Key ${deepseek.api_key_preview}，模型 ${deepseek.model || "deepseek-chat"}`
+    : "还没保存 DeepSeek API Key。";
+  deepseekStatus.className = `hint ${deepseekReady ? "ok" : "bad"}`;
 }
 
 async function saveProjectRoot() {
@@ -4408,6 +5197,41 @@ async function saveLovartKey() {
   } else {
     setStatus("Lovart 配置已保存，但 skill 路径还没找到。请检查 agent_skill.py 路径。", "bad");
   }
+}
+
+async function saveDeepSeekConfig() {
+  const apiKey = $("#deepseekApiKey").value.trim();
+  const enabled = $("#deepseekEnabled").checked;
+  const baseUrl = normalizeDeepSeekBaseUrlInput($("#deepseekBaseUrl").value);
+  const model = $("#deepseekModel").value.trim() || "deepseek-chat";
+  const hasSavedKey = Boolean(state.settings?.deepseek?.api_key_set);
+  if (enabled && !hasSavedKey && !apiKey) {
+    setStatus("启用前请先填写 DeepSeek API Key。", "bad");
+    return;
+  }
+  const payload = {
+    deepseek: {
+      enabled,
+      base_url: baseUrl,
+      model,
+    },
+  };
+  if (apiKey) payload.deepseek.api_key = apiKey;
+  const result = await api("/api/settings", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  state.settings = { ...(state.settings || {}), ...result };
+  $("#deepseekApiKey").value = "";
+  await loadSettings();
+  setStatus(enabled ? "提示词优化配置已保存。" : "提示词优化已关闭。", "ok");
+}
+
+function normalizeDeepSeekBaseUrlInput(value) {
+  let text = String(value || "").trim() || "https://api.deepseek.com";
+  if (!/^https?:\/\//i.test(text)) text = `https://${text}`;
+  text = text.replace(/^http:\/\//i, "https://");
+  return text.replace(/\/+$/, "") || "https://api.deepseek.com";
 }
 
 async function saveAssetLibrary() {
@@ -4610,7 +5434,7 @@ async function submitGeneration(nodeId, button = null) {
     const queuedForTail = result.job?.status === "queued" && result.job?.queue_reason === "waiting_prev_tail";
     const successMessage = queuedForTail
       ? (result.job?.failure_reason || "任务已进入任务记录，正在等待上一分镜尾帧。")
-      : "任务已进入任务记录，平台处理中。";
+      : (result.job?.failure_reason || "任务已进入任务队列，会在轮到时自动提交。");
     setStatus(successMessage, "ok");
     if (feedback) {
       feedback.textContent = successMessage;
@@ -4648,6 +5472,10 @@ function runningJobsWaitingForThread() {
     job.status === "running" && !job.lovart_thread_id && !job.jimeng_submit_id
   ) || (
     job.status === "queued" && job.queue_reason === "waiting_prev_tail"
+  ) || (
+    job.status === "queued" && job.queue_reason === "waiting_turn"
+  ) || (
+    job.status === "rate_limited"
   ));
 }
 
@@ -4662,7 +5490,7 @@ function autoQuerySummary() {
 }
 
 function canvasInteractionBusy() {
-  return Boolean(state.pan || state.marquee || state.nodeDrag || state.leftPanelResize);
+  return Boolean(state.pan || state.marquee || state.nodeDrag || state.leftPanelResize || state.rightPanelResize);
 }
 
 function scheduleAutoRefresh() {
@@ -4872,7 +5700,7 @@ async function markRateLimitedHandled(jobId) {
   state.jobs = fresh.jobs;
   state.assetLibrary = fresh.asset_library || state.assetLibrary;
   renderJobs();
-  setStatus(result.ok ? "并发限制已标记为处理完成，可以重新提交。" : "状态更新失败。", result.ok ? "ok" : "bad");
+  setStatus(result.ok ? "并发限制已解除，可以重新提交；不会自动转到其他平台。" : "状态更新失败。", result.ok ? "ok" : "bad");
   if (state.bulkSubmit.active) {
     processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
   }
@@ -4899,7 +5727,9 @@ function escapeHtml(value) {
 document.addEventListener("DOMContentLoaded", async () => {
   const contextMenu = $("#contextMenu");
   applyLeftPanelWidth(leftPanelWidth());
+  applyRightPanelWidth(rightPanelWidth());
   bindLeftPanelResize();
+  bindRightPanelResize();
   setPreferredSeedancePlatform(getPreferredSeedancePlatform());
   applyLeftSectionState();
   window.addEventListener("resize", () => {
@@ -4969,6 +5799,24 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (file) await importShotsFile(file);
     event.target.value = "";
   });
+  $("#scriptFile").addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (file) await importScriptFile(file);
+    event.target.value = "";
+  });
+  $("#scriptSourceText").addEventListener("input", (event) => {
+    state.script.source_text = event.target.value;
+  });
+  $("#scriptSourceText").addEventListener("mouseup", rememberScriptSelection);
+  $("#scriptSourceText").addEventListener("keyup", rememberScriptSelection);
+  $("#scriptShotSearch").addEventListener("input", renderScriptPanel);
+  $("#scriptBindShot").addEventListener("change", renderScriptPanel);
+  $("#saveScriptSource").addEventListener("click", () => {
+    saveScript().catch((error) => setStatus(`剧本保存失败：${error.message}`, "bad"));
+  });
+  $("#bindSelectedScript").addEventListener("click", () => {
+    bindSelectedScriptSegment().catch((error) => setStatus(`剧本绑定失败：${error.message}`, "bad"));
+  });
   $("#seedancePlatformPreference")?.addEventListener("change", (event) => {
     setPreferredSeedancePlatform(event.target.value);
     state.shots = sanitizeShotsForState(state.shots || []);
@@ -5007,6 +5855,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     setStatus("资产库统一图片模型已保存。", "ok");
   });
   $("#saveLovartKey").addEventListener("click", saveLovartKey);
+  $("#saveDeepSeekConfig").addEventListener("click", saveDeepSeekConfig);
   $("#toggleMarqueeMode").addEventListener("click", () => {
     hideContextMenu();
     toggleSelectionMode();
@@ -5052,6 +5901,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll("[data-close-tag-picker]").forEach((button) => {
     button.addEventListener("click", closeTagPicker);
   });
+  document.querySelectorAll("[data-close-prompt-optimizer]").forEach((button) => {
+    button.addEventListener("click", closePromptOptimizer);
+  });
   document.querySelectorAll("[data-close-project-picker]").forEach((button) => {
     button.addEventListener("click", closeProjectPicker);
   });
@@ -5060,6 +5912,22 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#seedanceImportLovart")?.addEventListener("click", () => closeSeedanceImportModal("lovart"));
   $("#seedanceImportJimeng")?.addEventListener("click", () => closeSeedanceImportModal("jimeng_cli"));
   $("#tagPickerSave").addEventListener("click", saveTagPicker);
+  $("#runPromptOptimizer").addEventListener("click", runPromptOptimizer);
+  $("#togglePromptFeedbackConfig").addEventListener("click", togglePromptFeedbackConfig);
+  $("#addPromptFeedbackPreset").addEventListener("click", () => {
+    addPromptFeedbackPreset().catch((error) => setStatus(`快捷反馈保存失败：${error.message}`, "bad"));
+  });
+  $("#promptFeedbackPresetInput").addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    addPromptFeedbackPreset().catch((error) => setStatus(`快捷反馈保存失败：${error.message}`, "bad"));
+  });
+  $("#resetPromptFeedbackPresets").addEventListener("click", () => {
+    resetPromptFeedbackPresets().catch((error) => setStatus(`快捷反馈保存失败：${error.message}`, "bad"));
+  });
+  $("#applyPromptImage").addEventListener("click", () => applyPromptOptimization(["image"]));
+  $("#applyPromptVideo").addEventListener("click", () => applyPromptOptimization(["video"]));
+  $("#applyPromptBoth").addEventListener("click", () => applyPromptOptimization(["image", "video"]));
   $("#projectCreateConfirm").addEventListener("click", createProjectFromPicker);
   $("#capturePreviewFrame").addEventListener("click", () => {
     if (!state.previewVideoNodeId) return setStatus("先打开一个视频预览。", "bad");
@@ -5192,6 +6060,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (event.key === "Escape") {
       hideContextMenu();
       if (!$("#videoPreviewModal")?.hidden) closeVideoPreview();
+      if (!$("#promptOptimizerModal")?.hidden) closePromptOptimizer();
     }
     const editing = isEditingElement(event.target) || isEditingElement(document.activeElement);
     if (!editing && !event.metaKey && !event.ctrlKey && !event.altKey) {

@@ -11,12 +11,14 @@ const PUBLIC_DIR = path.join(ROOT, "public");
 const DEFAULT_PROJECTS_DIR = path.join(ROOT, "projects");
 const LOCAL_DIR = path.join(DEFAULT_PROJECTS_DIR, ".local");
 const SETTINGS_FILE = path.join(LOCAL_DIR, "settings.json");
+const PROMPT_POLICY_FILE = path.join(ROOT, "prompt_policy.json");
 const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
 const DEFAULT_PYTHON = process.platform === "win32" ? "python" : "python3";
 const ENABLED_PLATFORMS = new Set(["lovart", "jimeng_cli"]);
 const PYTHON = process.env.PYTHON || DEFAULT_PYTHON;
 const DREAMINA = process.env.DREAMINA || "dreamina";
+const lovartProjectLocks = new Map();
 const HOMEBREW_FFMPEG = "/opt/homebrew/bin/ffmpeg";
 const HOMEBREW_FFPROBE = "/opt/homebrew/bin/ffprobe";
 const FFMPEG = process.env.FFMPEG || (fs.existsSync(HOMEBREW_FFMPEG) ? HOMEBREW_FFMPEG : "ffmpeg");
@@ -70,22 +72,37 @@ function writeJson(file, value) {
 function loadSettings() {
   const settings = readJson(SETTINGS_FILE, {});
   const projectRoot = process.env.AI_VIDEO_PROJECTS_DIR || settings.project_root || DEFAULT_PROJECTS_DIR;
+  const deepseek = settings.deepseek || {};
   return {
     lovart_access_key: process.env.LOVART_ACCESS_KEY || settings.lovart_access_key || "",
     lovart_secret_key: process.env.LOVART_SECRET_KEY || settings.lovart_secret_key || "",
     project_root: path.resolve(projectRoot),
     lovart_skill_path: process.env.LOVART_SKILL || settings.lovart_skill_path || DEFAULT_LOVART_SKILL,
+    deepseek: {
+      enabled: Boolean(deepseek.enabled),
+      apiKey: process.env.DEEPSEEK_API_KEY || deepseek.apiKey || "",
+      baseUrl: normalizeDeepSeekBaseUrl(process.env.DEEPSEEK_BASE_URL || deepseek.baseUrl || "https://api.deepseek.com"),
+      model: process.env.DEEPSEEK_MODEL || deepseek.model || "deepseek-chat",
+    },
   };
 }
 
 function saveSettings(next) {
   ensureDir(LOCAL_DIR);
   const current = loadSettings();
+  const currentDeepSeek = current.deepseek || {};
+  const incomingDeepSeek = next.deepseek || {};
   const settings = {
     lovart_access_key: next.lovart_access_key ?? current.lovart_access_key ?? "",
     lovart_secret_key: next.lovart_secret_key ?? current.lovart_secret_key ?? "",
     project_root: path.resolve(next.project_root || current.project_root || DEFAULT_PROJECTS_DIR),
     lovart_skill_path: String(next.lovart_skill_path ?? current.lovart_skill_path ?? DEFAULT_LOVART_SKILL).trim() || DEFAULT_LOVART_SKILL,
+    deepseek: {
+      enabled: incomingDeepSeek.enabled == null ? Boolean(currentDeepSeek.enabled) : Boolean(incomingDeepSeek.enabled),
+      apiKey: incomingDeepSeek.apiKey == null ? (currentDeepSeek.apiKey || "") : String(incomingDeepSeek.apiKey || "").trim(),
+      baseUrl: normalizeDeepSeekBaseUrl(incomingDeepSeek.baseUrl ?? currentDeepSeek.baseUrl ?? "https://api.deepseek.com"),
+      model: String(incomingDeepSeek.model ?? currentDeepSeek.model ?? "deepseek-chat").trim() || "deepseek-chat",
+    },
   };
   writeJson(SETTINGS_FILE, settings);
   return settings;
@@ -162,6 +179,67 @@ function renameFileForAsset(projectId, asset, nextName) {
   return asset;
 }
 
+function fileSizeBytes(filePath) {
+  try {
+    return fs.statSync(filePath).size;
+  } catch {
+    return 0;
+  }
+}
+
+async function compressImageAsset(projectId, asset, options = {}) {
+  if (!asset || asset.kind !== "image") throw new Error("只能压缩图片素材。");
+  if (!asset.file_path || !fs.existsSync(asset.file_path)) throw new Error("这个图片还没有本地文件，不能直接压缩。");
+  const projectRoot = projectDir(projectId);
+  const source = path.resolve(asset.file_path);
+  if (!source.startsWith(path.resolve(projectRoot) + path.sep)) {
+    throw new Error("只能压缩当前项目目录里的图片。");
+  }
+  const maxEdge = Math.max(512, Math.min(4096, Number(options.max_edge || 2048)));
+  const quality = Math.max(45, Math.min(92, Number(options.quality || 82)));
+  const targetBytes = Math.max(1, Number(options.target_mb || 20)) * 1024 * 1024;
+  const dir = path.dirname(source);
+  const base = safeName(path.basename(source, path.extname(source)) || asset.name || "image");
+  const dest = uniquePath(dir, `${base}_compressed.jpg`);
+  const logDir = path.join(projectRoot, "logs");
+  ensureDir(logDir);
+  const logFile = path.join(logDir, `compress_image_${Date.now()}.log`);
+  const result = await runCommand("/usr/bin/sips", [
+    "-s", "format", "jpeg",
+    "-s", "formatOptions", String(quality),
+    "-Z", String(maxEdge),
+    source,
+    "--out", dest,
+  ], logFile, {}, { timeoutMs: 30000 });
+  if (!result.ok || !fs.existsSync(dest)) {
+    try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
+    throw new Error(result.error || "图片压缩失败。");
+  }
+  const beforeBytes = fileSizeBytes(source);
+  const afterBytes = fileSizeBytes(dest);
+  if (afterBytes && beforeBytes && afterBytes >= beforeBytes) {
+    try { fs.unlinkSync(dest); } catch {}
+    throw new Error("压缩后没有变小，已保留原图。");
+  }
+  asset.original_file_path = asset.original_file_path || source;
+  asset.compressed_from = source;
+  asset.compressed_at = now();
+  asset.file_path = dest;
+  asset.thumbnail_path = dest;
+  asset.url = publicAssetUrl(projectId, dest);
+  asset.name = path.basename(dest, path.extname(dest));
+  asset.kind = "image";
+  asset.compression = {
+    before_bytes: beforeBytes,
+    after_bytes: afterBytes,
+    target_bytes: targetBytes,
+    max_edge: maxEdge,
+    quality,
+    under_target: afterBytes <= targetBytes,
+  };
+  return asset;
+}
+
 function projectDir(projectId) {
   return path.join(loadSettings().project_root, safeName(projectId));
 }
@@ -174,6 +252,8 @@ function loadProject(projectId) {
     shots: readJson(path.join(dir, "shots.json"), []),
     tags: readJson(path.join(dir, "tags.json"), []),
     jobs: readJson(path.join(dir, "jobs.json"), []),
+    prompt_context: loadPromptContext(projectId),
+    script: loadScript(projectId),
     asset_library: readJson(path.join(dir, "asset_library.json"), { global_rules: "", templates: [], image_model: "agent-auto" }),
   };
   migrateLovartMeta(projectId, data);
@@ -247,7 +327,14 @@ function migrateLovartMeta(projectId, data) {
   let projectChanged = false;
   let jobsChanged = false;
   for (const job of data.jobs || []) {
-    if (job.rate_limit_handled || /已在 Lovart 平台处理/.test(String(job.failure_reason || ""))) {
+    if (job.platform === "jimeng_cli" && (job.rate_limit_handled || /已在 Lovart 平台处理|并发限制已在 Lovart 平台处理|并发限制已标记为处理完成/.test(String(job.failure_reason || "")))) {
+      job.status = "rate_limited";
+      job.rate_limit_handled = false;
+      job.failure_reason = "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
+      jobsChanged = true;
+      continue;
+    }
+    if (job.rate_limit_handled || /已在 Lovart 平台处理|并发限制已在 Lovart 平台处理/.test(String(job.failure_reason || ""))) {
       if (job.status === "rate_limited") {
         job.status = "failed";
         jobsChanged = true;
@@ -256,8 +343,8 @@ function migrateLovartMeta(projectId, data) {
         job.rate_limit_handled = true;
         jobsChanged = true;
       }
-      if (/并发限制已在 Lovart 平台处理/.test(String(job.failure_reason || ""))) {
-        job.failure_reason = "已在 Lovart 平台处理，可重新提交任务。";
+      if (/已在 Lovart 平台处理|并发限制已在 Lovart 平台处理/.test(String(job.failure_reason || ""))) {
+        job.failure_reason = rateLimitHandledReason(job);
         jobsChanged = true;
       }
     }
@@ -334,6 +421,158 @@ function repairAssetKindsFromFiles(projectId, data) {
   return changed;
 }
 
+function defaultPromptPolicy() {
+  return {
+    version: "2026-05-19-v1",
+    summary: "AI 视频无限画布提示词优化工具级规则快照。v1 只做文本优化建议，不看图、不看视频、不自动提交生成。",
+    rules: [
+      "优化功能只改写文本建议，不直接提交 Lovart 或即梦任务。",
+      "优化结果必须先展示差异，用户确认后才写回当前分镜或节点。",
+      "Seedance 提示词必须保留 @ 资产锚点。",
+      "Kling 视频提示词不要直接使用 @ 资产锚点，需要改写成自然语言。",
+      "Lovart 角色资产提交时必须保留 URL 参考规则。",
+      "即梦单图、多图提交继续使用本地已导入资产。",
+      "角色资产强调稳定身份特征，不写动作变体。",
+      "场景和道具资产保持无人称、无角色召唤。",
+      "spoken lines 默认使用口语英文，除非用户明确要求其他语言。",
+    ],
+    response_contract: {
+      required_json_fields: ["revised_image_prompt", "revised_video_prompt", "change_summary", "project_learning_suggestions", "warnings"],
+    },
+  };
+}
+
+function loadPromptPolicy() {
+  return readJson(PROMPT_POLICY_FILE, defaultPromptPolicy());
+}
+
+function defaultPromptContext(policyVersion = loadPromptPolicy().version) {
+  return {
+    policy_version: policyVersion,
+    project_context: {
+      style: "",
+      asset_summary: "",
+      model_preferences: "",
+      overrides: [],
+    },
+    learnings: [],
+    feedback_presets: defaultPromptFeedbackPresets(),
+    revisions: [],
+    updated_at: now(),
+  };
+}
+
+function defaultPromptFeedbackPresets() {
+  return [
+    "人物不像",
+    "动作太多",
+    "镜头不稳",
+    "不要新增人物",
+    "更电影感",
+    "保留 @ 标签",
+    "减少肢体变形",
+    "保持上一镜连续性",
+  ];
+}
+
+function sanitizeStringArray(value, limit = 50) {
+  return Array.isArray(value)
+    ? value.map((item) => String(item || "").trim()).filter(Boolean).slice(0, limit)
+    : [];
+}
+
+function sanitizePromptContext(raw = {}) {
+  const fallback = defaultPromptContext(raw.policy_version || loadPromptPolicy().version);
+  const projectContext = raw.project_context && typeof raw.project_context === "object" ? raw.project_context : {};
+  return {
+    policy_version: String(raw.policy_version || fallback.policy_version || "").trim(),
+    project_context: {
+      style: String(projectContext.style || "").trim(),
+      asset_summary: String(projectContext.asset_summary || "").trim(),
+      model_preferences: String(projectContext.model_preferences || "").trim(),
+      overrides: sanitizeStringArray(projectContext.overrides, 30),
+    },
+    learnings: sanitizeStringArray(raw.learnings, 100),
+    feedback_presets: raw.feedback_presets == null
+      ? fallback.feedback_presets
+      : sanitizeStringArray(raw.feedback_presets, 30),
+    revisions: Array.isArray(raw.revisions)
+      ? raw.revisions.slice(-80).map((item) => ({
+          revision_id: String(item.revision_id || id("promptrev")),
+          created_at: String(item.created_at || now()),
+          shot_id: String(item.shot_id || ""),
+          node_id: String(item.node_id || ""),
+          feedback: String(item.feedback || ""),
+          original_image_prompt: String(item.original_image_prompt || ""),
+          revised_image_prompt: String(item.revised_image_prompt || ""),
+          original_video_prompt: String(item.original_video_prompt || ""),
+          revised_video_prompt: String(item.revised_video_prompt || ""),
+          change_summary: String(item.change_summary || ""),
+          warnings: sanitizeStringArray(item.warnings, 20),
+          applied_fields: sanitizeStringArray(item.applied_fields, 5),
+          target_label: String(item.target_label || ""),
+          script_segment_title: String(item.script_segment_title || ""),
+          script_segment_text: String(item.script_segment_text || ""),
+        }))
+      : [],
+    updated_at: String(raw.updated_at || now()),
+  };
+}
+
+function loadPromptContext(projectId) {
+  const file = path.join(projectDir(projectId), "prompt_context.json");
+  return sanitizePromptContext(readJson(file, defaultPromptContext()));
+}
+
+function savePromptContext(projectId, context) {
+  const next = sanitizePromptContext({ ...context, updated_at: now() });
+  saveProjectPart(projectId, "prompt_context.json", next);
+  return next;
+}
+
+function defaultScript() {
+  return {
+    source_text: "",
+    segments: [],
+    bindings: [],
+    updated_at: now(),
+  };
+}
+
+function sanitizeScript(raw = {}) {
+  return {
+    source_text: String(raw.source_text || ""),
+    segments: Array.isArray(raw.segments)
+      ? raw.segments.slice(-500).map((segment) => ({
+          segment_id: String(segment.segment_id || id("scriptseg")),
+          title: String(segment.title || "").trim(),
+          text: String(segment.text || "").trim(),
+          created_at: String(segment.created_at || now()),
+          updated_at: String(segment.updated_at || segment.created_at || now()),
+        })).filter((segment) => segment.text)
+      : [],
+    bindings: Array.isArray(raw.bindings)
+      ? raw.bindings.map((binding) => ({
+          shot_id: String(binding.shot_id || "").trim(),
+          segment_id: String(binding.segment_id || "").trim(),
+          updated_at: String(binding.updated_at || now()),
+        })).filter((binding) => binding.shot_id && binding.segment_id)
+      : [],
+    updated_at: String(raw.updated_at || now()),
+  };
+}
+
+function loadScript(projectId) {
+  const file = path.join(projectDir(projectId), "script.json");
+  return sanitizeScript(readJson(file, defaultScript()));
+}
+
+function saveScript(projectId, script) {
+  const next = sanitizeScript({ ...script, updated_at: now() });
+  saveProjectPart(projectId, "script.json", next);
+  return next;
+}
+
 function createProject(name) {
   ensureDir(loadSettings().project_root);
   const projectId = safeName(name || "AI视频项目");
@@ -356,6 +595,8 @@ function createProject(name) {
   if (!fs.existsSync(path.join(dir, "shots.json"))) writeJson(path.join(dir, "shots.json"), []);
   if (!fs.existsSync(path.join(dir, "tags.json"))) writeJson(path.join(dir, "tags.json"), []);
   if (!fs.existsSync(path.join(dir, "jobs.json"))) writeJson(path.join(dir, "jobs.json"), []);
+  if (!fs.existsSync(path.join(dir, "prompt_context.json"))) writeJson(path.join(dir, "prompt_context.json"), defaultPromptContext());
+  if (!fs.existsSync(path.join(dir, "script.json"))) writeJson(path.join(dir, "script.json"), defaultScript());
   if (!fs.existsSync(path.join(dir, "asset_library.json"))) writeJson(path.join(dir, "asset_library.json"), defaultAssetLibrary());
   return loadProject(projectId);
 }
@@ -880,6 +1121,240 @@ function parseJsonFromOutput(output) {
   return JSON.parse(text);
 }
 
+function normalizeDeepSeekBaseUrl(value) {
+  let text = String(value || "").trim() || "https://api.deepseek.com";
+  if (!/^https?:\/\//i.test(text)) text = `https://${text}`;
+  text = text.replace(/^http:\/\//i, "https://");
+  return text.replace(/\/+$/, "") || "https://api.deepseek.com";
+}
+
+function isHtmlResponse(text) {
+  return /<\s*html[\s>]|<\s*body[\s>]|<\s*h1[\s>]/i.test(String(text || ""));
+}
+
+function plainErrorText(text) {
+  return String(text || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+}
+
+function deepSeekHttpErrorMessage(statusCode, data, headers = {}) {
+  const raw = String(data?.raw || "");
+  const location = String(headers.location || "");
+  if ([301, 302, 307, 308].includes(statusCode)) {
+    const target = location ? `（跳转到 ${location}）` : "";
+    return `DeepSeek 地址发生跳转${target}。请把 Base URL 改为 https://api.deepseek.com 后重试。`;
+  }
+  if (isHtmlResponse(raw)) {
+    const text = plainErrorText(raw);
+    return text
+      ? `DeepSeek 返回了网页错误页：${text}。请检查 Base URL 是否为 https://api.deepseek.com。`
+      : "DeepSeek 返回了网页错误页。请检查 Base URL 是否为 https://api.deepseek.com。";
+  }
+  return data?.error?.message || data?.message || raw || `请求失败，状态码 ${statusCode}`;
+}
+
+function postJson(urlValue, payload, headers = {}) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try {
+      target = new URL(urlValue);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const body = JSON.stringify(payload);
+    const requestImpl = target.protocol === "http:" ? http : https;
+    const req = requestImpl.request({
+      method: "POST",
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "http:" ? 80 : 443),
+      path: `${target.pathname}${target.search}`,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        ...headers,
+      },
+      timeout: 60000,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        let data = null;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          data = { raw: text };
+        }
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+          return;
+        }
+        const message = deepSeekHttpErrorMessage(res.statusCode, data, res.headers);
+        reject(new Error(message));
+      });
+    });
+    req.on("timeout", () => {
+      req.destroy(new Error("优化请求超时，可以稍后重试。"));
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function extractJsonObject(text) {
+  const source = String(text || "").trim();
+  if (!source) throw new Error("模型没有返回内容。");
+  try {
+    return JSON.parse(source);
+  } catch {}
+  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    try {
+      return JSON.parse(fenced[1].trim());
+    } catch {}
+  }
+  const start = source.indexOf("{");
+  const end = source.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return JSON.parse(source.slice(start, end + 1));
+  }
+  throw new Error("模型返回格式异常，可以重试或手动修改。");
+}
+
+function appendMissingPromptTags(prompt, requiredTags = []) {
+  const text = String(prompt || "").trim();
+  const existing = new Set(extractTags(text));
+  const missing = requiredTags.filter((tag) => tag && !existing.has(tag));
+  if (!missing.length) return { prompt: text, missing };
+  return {
+    prompt: [missing.join(" "), text].filter(Boolean).join("\n"),
+    missing,
+  };
+}
+
+function shouldPreservePromptTags(context = {}) {
+  return !isKlingModelName(context.model || context.video_model || "");
+}
+
+function normalizePromptOptimization(raw, original = {}) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const warnings = sanitizeStringArray(value.warnings, 10);
+  let revisedImagePrompt = String(value.revised_image_prompt ?? original.image_prompt ?? "");
+  let revisedVideoPrompt = String(value.revised_video_prompt ?? original.video_prompt ?? "");
+  if (shouldPreservePromptTags(original)) {
+    const imageTags = extractTags(original.image_prompt || "");
+    const videoTags = extractTags(original.video_prompt || "");
+    const imageResult = appendMissingPromptTags(revisedImagePrompt, imageTags);
+    const videoResult = appendMissingPromptTags(revisedVideoPrompt, videoTags);
+    revisedImagePrompt = imageResult.prompt;
+    revisedVideoPrompt = videoResult.prompt;
+    const recovered = Array.from(new Set([...imageResult.missing, ...videoResult.missing]));
+    if (recovered.length) {
+      warnings.push(`模型漏掉了原提示词标签，系统已自动补回：${recovered.join("、")}。`);
+    }
+  }
+  return {
+    revised_image_prompt: revisedImagePrompt,
+    revised_video_prompt: revisedVideoPrompt,
+    change_summary: String(value.change_summary || "已根据反馈整理提示词。"),
+    project_learning_suggestions: sanitizeStringArray(value.project_learning_suggestions, 10),
+    warnings: sanitizeStringArray(warnings, 10),
+  };
+}
+
+function deepSeekChatUrl(baseUrl) {
+  const clean = String(baseUrl || "https://api.deepseek.com").replace(/\/+$/, "");
+  return /\/chat\/completions$/i.test(clean) ? clean : `${clean}/chat/completions`;
+}
+
+function compactContextForPrompt(context = {}) {
+  return {
+    policy_version: context.policy_version || "",
+    project_context: context.project_context || {},
+    learnings: (context.learnings || []).slice(-12),
+    recent_revisions: (context.revisions || []).slice(-5).map((item) => ({
+      shot_id: item.shot_id,
+      feedback: item.feedback,
+      change_summary: item.change_summary,
+      warnings: item.warnings || [],
+      applied_fields: item.applied_fields || [],
+    })),
+  };
+}
+
+async function optimizePromptWithDeepSeek(projectId, requestBody = {}) {
+  const settings = loadSettings().deepseek || {};
+  if (!settings.enabled || !settings.apiKey) {
+    throw new Error("需要先配置 DeepSeek Key，再使用提示词优化。");
+  }
+  const policy = loadPromptPolicy();
+  const context = loadPromptContext(projectId);
+  const original = {
+    image_prompt: String(requestBody.image_prompt || requestBody.shot?.image_prompt || ""),
+    video_prompt: String(requestBody.video_prompt || requestBody.shot?.video_prompt || ""),
+    model: String(requestBody.model || requestBody.video_model || requestBody.shot?.video_model || ""),
+    platform: String(requestBody.platform || requestBody.shot?.platform || ""),
+  };
+  const payload = {
+    task: "Optimize the selected AI video shot prompts. Return JSON only.",
+    user_feedback: String(requestBody.user_feedback || "").trim(),
+    policy,
+    project_context: compactContextForPrompt(context),
+    script_segment: requestBody.script_segment && typeof requestBody.script_segment === "object"
+      ? {
+          segment_id: String(requestBody.script_segment.segment_id || ""),
+          title: String(requestBody.script_segment.title || ""),
+          text: String(requestBody.script_segment.text || ""),
+        }
+      : null,
+    shot: {
+      shot_id: String(requestBody.shot_id || requestBody.shot?.shot_id || ""),
+      transition: String(requestBody.transition || requestBody.shot?.transition || ""),
+      platform: String(requestBody.platform || requestBody.shot?.platform || ""),
+      model: String(requestBody.model || requestBody.video_model || requestBody.shot?.video_model || ""),
+      mode: String(requestBody.mode || ""),
+      duration: String(requestBody.duration || requestBody.shot?.duration || ""),
+      size: String(requestBody.size || requestBody.shot?.size || ""),
+      image_prompt: original.image_prompt,
+      video_prompt: original.video_prompt,
+      tag_refs: Array.isArray(requestBody.tag_refs) ? requestBody.tag_refs : (requestBody.shot?.tag_refs || []),
+      bound_assets: Array.isArray(requestBody.bound_assets) ? requestBody.bound_assets : [],
+    },
+  };
+  const response = await postJson(deepSeekChatUrl(settings.baseUrl), {
+    model: settings.model || "deepseek-chat",
+    temperature: 0.3,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: [
+          "You are a concise AI film prompt optimizer for a local AI video canvas.",
+          "Only rewrite text prompts. Do not suggest submitting generation jobs.",
+          "Preserve model-specific anchor rules from the policy.",
+          "If script_segment is provided, preserve its story intent while improving visual prompt clarity.",
+          "Return valid JSON only with these fields: revised_image_prompt, revised_video_prompt, change_summary, project_learning_suggestions, warnings.",
+        ].join("\n"),
+      },
+      {
+        role: "user",
+        content: JSON.stringify(payload, null, 2),
+      },
+    ],
+  }, {
+    Authorization: `Bearer ${settings.apiKey}`,
+  });
+  const content = response?.choices?.[0]?.message?.content || "";
+  return normalizePromptOptimization(extractJsonObject(content), original);
+}
+
 function isConcurrentLimit(message) {
   return /Concurrent task limit|ExceedConcurrencyLimit|ConcurrencyLimit|并发|concurrent|concurrency/i.test(String(message || ""));
 }
@@ -888,6 +1363,11 @@ function jimengFailureReason(parsed = {}, fallback = "即梦平台退回失败�
   const reason = String(parsed.fail_reason || parsed.message || parsed.error || "").trim();
   if (isConcurrentLimit(reason)) return "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
   return reason || fallback;
+}
+
+function rateLimitHandledReason(job = {}) {
+  if (job.platform === "lovart") return "Lovart 并发限制已标记为处理完成，可重新提交任务。";
+  return "当前平台并发限制已标记为处理完成，可重新提交任务。";
 }
 
 function collectInputs(canvas, nodeIds) {
@@ -1172,7 +1652,7 @@ function buildJimengReferencePrompt(orderedInputs = [], mode = "") {
   return [lines.join("，"), usage].join("\n");
 }
 
-async function ensureLovartProject(projectId, env) {
+async function ensureLovartProjectUnlocked(projectId, env) {
   const data = loadProject(projectId);
   const skillPath = lovartSkillPath();
   if (data.project?.lovart_project_id) return data.project.lovart_project_id;
@@ -1196,6 +1676,17 @@ async function ensureLovartProject(projectId, env) {
   await runCommand(PYTHON, [skillPath, "project-rename", "--project-id", lovartProjectId, "--name", data.project?.name || projectId], renameLog, env);
   saveProjectMeta(projectId, { lovart_project_id: lovartProjectId });
   return lovartProjectId;
+}
+
+async function ensureLovartProject(projectId, env) {
+  const key = String(projectId || "AI视频项目");
+  const existing = lovartProjectLocks.get(key);
+  if (existing) return existing;
+  const pending = ensureLovartProjectUnlocked(projectId, env).finally(() => {
+    lovartProjectLocks.delete(key);
+  });
+  lovartProjectLocks.set(key, pending);
+  return pending;
 }
 
 function maskSecret(text, secret) {
@@ -1928,17 +2419,78 @@ function assetTemplateOutputName(job, suffix = "") {
   return safeName(`${ext ? path.basename(base, ext) : base}${suffix}`);
 }
 
-function blockingJobs(jobs) {
-  return (jobs || []).filter((job) => job.status === "rate_limited");
+function isJimengVipModel(model) {
+  return /_vip$/i.test(String(model || "").trim());
 }
 
-function activeDuplicateJobs(jobs, targetNodeId) {
+function activeJobsForPlatform(jobs = [], platform = "lovart") {
+  const normalizedPlatform = normalizePlatform(platform);
+  return (jobs || []).filter((job) => {
+    if (!["running", "pending_confirmation"].includes(job.status)) return false;
+    if (normalizePlatform(job.platform || "lovart") !== normalizedPlatform) return false;
+    return true;
+  });
+}
+
+function hasPendingRateLimitForPlatform(jobs = [], platform = "lovart") {
+  const normalizedPlatform = normalizePlatform(platform);
+  return (jobs || []).some((job) => (
+    job.status === "rate_limited"
+    && !job.rate_limit_handled
+    && normalizePlatform(job.platform || "lovart") === normalizedPlatform
+  ));
+}
+
+function hasSubmittingJobForPlatform(jobs = [], platform = "lovart") {
+  const normalizedPlatform = normalizePlatform(platform);
+  return (jobs || []).some((job) => {
+    if (job.status !== "running") return false;
+    if (normalizePlatform(job.platform || "lovart") !== normalizedPlatform) return false;
+    if (normalizedPlatform === "lovart") return !job.lovart_thread_id;
+    if (normalizedPlatform === "jimeng_cli") return !job.jimeng_submit_id;
+    return true;
+  });
+}
+
+function canStartQueuedJob(jobs = [], job = {}) {
+  const platform = normalizePlatform(job.platform || "lovart");
+  const activeCount = activeJobsForPlatform(jobs, platform).length;
+  if (platform === "lovart") {
+    if (hasPendingRateLimitForPlatform(jobs, "lovart")) return false;
+    if (hasSubmittingJobForPlatform(jobs, "lovart")) return false;
+    return activeCount < 9;
+  }
+  if (hasPendingRateLimitForPlatform(jobs, platform) && activeCount > 0) return false;
+  if (platform === "jimeng_cli" && isJimengVipModel(job.parameters?.model)) return true;
+  return activeCount === 0;
+}
+
+function jobBlocksSubmission(job = {}, incoming = {}, jobs = []) {
+  if (job.status !== "rate_limited" || job.rate_limit_handled) return false;
+  const jobPlatform = normalizePlatform(job.platform || "lovart");
+  const incomingPlatform = normalizePlatform(incoming.platform || "lovart");
+  if (jobPlatform !== incomingPlatform) return false;
+  if (incomingPlatform === "jimeng_cli" && isJimengVipModel(incoming.model)) return false;
+  if (incomingPlatform === "jimeng_cli") return activeJobsForPlatform(jobs, incomingPlatform).length > 0;
+  return true;
+}
+
+function blockingJobs(jobs, incoming = {}) {
+  return (jobs || []).filter((job) => jobBlocksSubmission(job, incoming, jobs));
+}
+
+function activeDuplicateJobs(jobs, targetNodeId, incoming = {}) {
   return (jobs || []).filter((job) => {
     if (job.target_node_id !== targetNodeId) return false;
     if (job.status === "running" || job.status === "queued" || job.status === "pending_confirmation") return true;
-    if (job.status === "rate_limited" && !job.rate_limit_handled) return true;
+    if (jobBlocksSubmission(job, incoming, jobs)) return true;
     return false;
   });
+}
+
+function pruneDormantJobsForTarget(jobs = [], targetNodeId = "") {
+  const dormantStatuses = new Set(["queued", "rate_limited", "failed", "cancelled"]);
+  return jobs.filter((job) => job.target_node_id !== targetNodeId || !dormantStatuses.has(job.status));
 }
 
 function placeResultNodes(canvas, assets, anchor, job = {}) {
@@ -2101,10 +2653,27 @@ async function resumeQueuedContinuousJobs(projectId) {
   const jobsToStart = [];
   let changed = false;
   for (const job of data.jobs || []) {
-    if (job.status !== "queued" || job.queue_reason !== "waiting_prev_tail") continue;
-    const prepared = await ensureContinuousShotTailFrame(projectId, data, job);
-    if (!prepared.ready) {
-      const waitingReason = prepared.reason || "正在等待上一分镜尾帧。";
+    if (job.status === "queued" && job.queue_reason === "waiting_prev_tail") {
+      const prepared = await ensureContinuousShotTailFrame(projectId, data, job);
+      if (!prepared.ready) {
+        const waitingReason = prepared.reason || "正在等待上一分镜尾帧。";
+        if (job.failure_reason !== waitingReason) {
+          job.failure_reason = waitingReason;
+          job.updated_at = now();
+          changed = true;
+        }
+        continue;
+      }
+      job.queue_reason = "waiting_turn";
+      job.failure_reason = "已拿到上一镜尾帧，待提交。";
+      job.updated_at = now();
+      changed = true;
+    }
+    if (job.status !== "queued" && job.status !== "rate_limited") continue;
+    if (!canStartQueuedJob(data.jobs, job)) {
+      const waitingReason = job.platform === "jimeng_cli"
+        ? "即梦当前还有任务在生成，等结果返回后自动提交。"
+        : "待提交：Lovart 按单通道提交，等前一条拿到平台返回后自动提交。";
       if (job.failure_reason !== waitingReason) {
         job.failure_reason = waitingReason;
         job.updated_at = now();
@@ -2115,6 +2684,7 @@ async function resumeQueuedContinuousJobs(projectId) {
     job.status = "running";
     job.failure_reason = "";
     delete job.queue_reason;
+    job.rate_limit_handled = false;
     job.updated_at = now();
     updateAssetLibraryAfterJob(projectId, job, { status: "running", failure_reason: "" });
     jobsToStart.push(job.job_id);
@@ -2443,6 +3013,8 @@ async function processLovartJobSubmission(projectId, jobId) {
   if (!storedJob) return;
   if (result.lovart_project_id) storedJob.lovart_project_id = result.lovart_project_id;
   if (result.lovart_thread_id) storedJob.lovart_thread_id = result.lovart_thread_id;
+  if (!storedJob.lovart_project_id && job.lovart_project_id) storedJob.lovart_project_id = job.lovart_project_id;
+  if (!storedJob.lovart_thread_id && job.lovart_thread_id) storedJob.lovart_thread_id = job.lovart_thread_id;
   if (result.jimeng_submit_id) storedJob.jimeng_submit_id = result.jimeng_submit_id;
   if (job.submitted_prompt) storedJob.submitted_prompt = job.submitted_prompt;
   if (job.submitted_command) storedJob.submitted_command = job.submitted_command;
@@ -2457,6 +3029,9 @@ async function processLovartJobSubmission(projectId, jobId) {
       failure_reason: status === "running" ? "" : (result.reason || ""),
     });
     saveProjectPart(projectId, "jobs.json", fresh.jobs);
+    if (storedJob.platform === "lovart" && storedJob.lovart_thread_id && status !== "rate_limited") {
+      void resumeQueuedContinuousJobs(projectId).catch(() => {});
+    }
     return;
   }
 
@@ -2474,7 +3049,7 @@ async function processLovartJobSubmission(projectId, jobId) {
   attachGeneratedAssetsToTemplate(projectId, storedJob, cleanAssets);
   saveProjectPart(projectId, "canvas.json", fresh.canvas);
   saveProjectPart(projectId, "jobs.json", fresh.jobs);
-  if (storedJob.kind === "video") {
+  if (storedJob.platform === "lovart" || storedJob.kind === "video") {
     void resumeQueuedContinuousJobs(projectId).catch(() => {});
   }
 }
@@ -2618,6 +3193,70 @@ async function handleApi(req, res) {
     const body = await readBody(req);
     saveProjectPart(body.project_id, "tags.json", body.tags);
     return send(res, 200, { ok: true });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/script/save") {
+    const body = await readBody(req);
+    const projectId = body.project_id || "AI视频项目";
+    createProject(projectId);
+    return send(res, 200, { ok: true, script: saveScript(projectId, body.script || {}) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/prompt-policy") {
+    return send(res, 200, loadPromptPolicy());
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/prompt-context") {
+    const projectId = url.searchParams.get("project_id") || "AI视频项目";
+    createProject(projectId);
+    return send(res, 200, loadPromptContext(projectId));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/prompt-context") {
+    const body = await readBody(req);
+    const projectId = body.project_id || "AI视频项目";
+    createProject(projectId);
+    let context = loadPromptContext(projectId);
+    if (body.context && typeof body.context === "object") {
+      context = sanitizePromptContext(body.context);
+    }
+    if (body.project_context && typeof body.project_context === "object") {
+      context.project_context = {
+        ...context.project_context,
+        style: body.project_context.style == null ? context.project_context.style : String(body.project_context.style || "").trim(),
+        asset_summary: body.project_context.asset_summary == null ? context.project_context.asset_summary : String(body.project_context.asset_summary || "").trim(),
+        model_preferences: body.project_context.model_preferences == null ? context.project_context.model_preferences : String(body.project_context.model_preferences || "").trim(),
+        overrides: body.project_context.overrides == null ? context.project_context.overrides : sanitizeStringArray(body.project_context.overrides, 30),
+      };
+    }
+    const learningItems = sanitizeStringArray([
+      ...(Array.isArray(body.learnings) ? body.learnings : []),
+      body.learning || "",
+    ], 20);
+    for (const learning of learningItems) {
+      if (!context.learnings.includes(learning)) context.learnings.push(learning);
+    }
+    if (body.feedback_presets != null) {
+      context.feedback_presets = sanitizeStringArray(body.feedback_presets, 30);
+    }
+    if (body.revision && typeof body.revision === "object") {
+      context.revisions.push({
+        revision_id: body.revision.revision_id || id("promptrev"),
+        created_at: body.revision.created_at || now(),
+        ...body.revision,
+      });
+    }
+    return send(res, 200, { ok: true, prompt_context: savePromptContext(projectId, context) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/prompt-optimize") {
+    const body = await readBody(req);
+    const projectId = body.project_id || "AI视频项目";
+    createProject(projectId);
+    const feedback = String(body.user_feedback || "").trim();
+    if (!feedback) return send(res, 400, { ok: false, error: "先写一句这次哪里不理想。" });
+    const result = await optimizePromptWithDeepSeek(projectId, body);
+    return send(res, 200, { ok: true, result });
   }
 
   if (req.method === "POST" && url.pathname === "/api/asset-library/import") {
@@ -2806,6 +3445,28 @@ async function handleApi(req, res) {
     return send(res, 200, { ok: true, asset, canvas: data.canvas });
   }
 
+  if (req.method === "POST" && url.pathname === "/api/assets/compress") {
+    const body = await readBody(req);
+    const data = loadProject(body.project_id);
+    const assetId = String(body.asset_id || "");
+    const asset = data.canvas.assets.find((item) => item.asset_id === assetId);
+    if (!asset) return send(res, 404, { ok: false, error: "找不到这个资产。" });
+    try {
+      await compressImageAsset(body.project_id, asset, {
+        target_mb: body.target_mb,
+        max_edge: body.max_edge,
+        quality: body.quality,
+      });
+    } catch (error) {
+      return send(res, 400, { ok: false, error: error.message || "图片压缩失败。" });
+    }
+    for (const node of data.canvas.nodes) {
+      if (node.data?.asset_id === assetId) node.data.title = asset.name;
+    }
+    saveProjectPart(body.project_id, "canvas.json", data.canvas);
+    return send(res, 200, { ok: true, asset, canvas: data.canvas });
+  }
+
   if (req.method === "POST" && url.pathname === "/api/assets/meta") {
     const body = await readBody(req);
     const data = loadProject(body.project_id);
@@ -2842,6 +3503,15 @@ async function handleApi(req, res) {
       project_root: settings.project_root,
       lovart_skill_path: settings.lovart_skill_path,
       lovart_skill_exists: fs.existsSync(settings.lovart_skill_path),
+      deepseek: {
+        enabled: Boolean(settings.deepseek?.enabled),
+        api_key_set: Boolean(settings.deepseek?.apiKey),
+        api_key_preview: settings.deepseek?.apiKey
+          ? `${settings.deepseek.apiKey.slice(0, 4)}••••${settings.deepseek.apiKey.slice(-4)}`
+          : "",
+        base_url: settings.deepseek?.baseUrl || "https://api.deepseek.com",
+        model: settings.deepseek?.model || "deepseek-chat",
+      },
       python_command: PYTHON,
     });
   }
@@ -2853,6 +3523,14 @@ async function handleApi(req, res) {
       lovart_secret_key: body.lovart_secret_key == null ? undefined : String(body.lovart_secret_key || "").trim(),
       project_root: body.project_root == null ? undefined : String(body.project_root || "").trim(),
       lovart_skill_path: body.lovart_skill_path == null ? undefined : String(body.lovart_skill_path || "").trim(),
+      deepseek: body.deepseek && typeof body.deepseek === "object"
+        ? {
+            enabled: body.deepseek.enabled,
+            apiKey: body.deepseek.api_key == null ? undefined : String(body.deepseek.api_key || "").trim(),
+            baseUrl: body.deepseek.base_url == null ? undefined : String(body.deepseek.base_url || "").trim(),
+            model: body.deepseek.model == null ? undefined : String(body.deepseek.model || "").trim(),
+          }
+        : undefined,
     });
     return send(res, 200, {
       ok: true,
@@ -2861,6 +3539,15 @@ async function handleApi(req, res) {
       project_root: settings.project_root,
       lovart_skill_path: settings.lovart_skill_path,
       lovart_skill_exists: fs.existsSync(settings.lovart_skill_path),
+      deepseek: {
+        enabled: Boolean(settings.deepseek?.enabled),
+        api_key_set: Boolean(settings.deepseek?.apiKey),
+        api_key_preview: settings.deepseek?.apiKey
+          ? `${settings.deepseek.apiKey.slice(0, 4)}••••${settings.deepseek.apiKey.slice(-4)}`
+          : "",
+        base_url: settings.deepseek?.baseUrl || "https://api.deepseek.com",
+        model: settings.deepseek?.model || "deepseek-chat",
+      },
       python_command: PYTHON,
     });
   }
@@ -2868,29 +3555,17 @@ async function handleApi(req, res) {
   if (req.method === "POST" && url.pathname === "/api/jobs/submit") {
     const body = await readBody(req);
     const data = loadProject(body.project_id);
-    const blockers = blockingJobs(data.jobs);
-    if (blockers.length) {
-      return send(res, 200, {
-        ok: false,
-        blocked: true,
-        error: "还有并发限制任务。请先去对应平台处理后再继续提交。",
-        blockers: blockers.map((job) => ({
-          job_id: job.job_id,
-          platform: job.platform || "lovart",
-          status: job.status,
-          kind: job.kind,
-          prompt: job.prompt,
-          failure_reason: job.failure_reason,
-          lovart_thread_id: job.lovart_thread_id,
-        })),
-      });
-    }
     const targetNode = data.canvas.nodes.find((node) => node.id === body.node_id);
     if (!targetNode || !["imageGen", "videoGen"].includes(targetNode.type)) {
       return send(res, 400, { ok: false, error: "请选择图片生成或视频生成节点。" });
     }
+    const kind = targetNode.type === "imageGen" ? "image" : "video";
+    const generatorData = normalizeGeneratorData(targetNode.data || {});
+    const platform = generatorData.platform;
+    const parameters = generatorParameters(generatorData);
+    data.jobs = pruneDormantJobsForTarget(data.jobs, targetNode.id);
     if (!body.force_duplicate) {
-      const duplicates = activeDuplicateJobs(data.jobs, targetNode.id);
+      const duplicates = activeDuplicateJobs(data.jobs, targetNode.id, { platform, model: parameters.model });
       if (duplicates.length) {
         return send(res, 200, {
           ok: false,
@@ -2911,9 +3586,6 @@ async function handleApi(req, res) {
       }
     }
 
-    const kind = targetNode.type === "imageGen" ? "image" : "video";
-    const generatorData = normalizeGeneratorData(targetNode.data || {});
-    const platform = generatorData.platform;
     if (!ENABLED_PLATFORMS.has(platform)) {
       return send(res, 400, {
         ok: false,
@@ -2942,8 +3614,9 @@ async function handleApi(req, res) {
       asset_template_label: targetNode.data?.asset_template_label || undefined,
       asset_template_filename: targetNode.data?.asset_template_filename || undefined,
       asset_category: targetNode.data?.asset_category || undefined,
-      status: "running",
-      failure_reason: undefined,
+      status: "queued",
+      queue_reason: "waiting_turn",
+      failure_reason: "已进入任务队列，待提交。",
       output_asset_ids: [],
       processed_download_keys: [],
       created_at: now(),
@@ -2957,21 +3630,7 @@ async function handleApi(req, res) {
     updateAssetLibraryAfterJob(body.project_id, job, { status: job.status, failure_reason: job.failure_reason || "" });
     data.jobs.push(job);
     saveProjectPart(body.project_id, "jobs.json", data.jobs);
-    if (job.status === "queued") {
-      void resumeQueuedContinuousJobs(body.project_id).catch(() => {});
-    } else {
-      void processLovartJobSubmission(body.project_id, job.job_id).catch((error) => {
-        const fresh = loadProject(body.project_id);
-        const storedJob = fresh.jobs.find((item) => item.job_id === job.job_id);
-        if (!storedJob) return;
-        storedJob.status = "failed";
-        saveBackgroundErrorLog(body.project_id, job.job_id, error);
-        storedJob.failure_reason = backgroundErrorMessage(error);
-        storedJob.updated_at = now();
-        updateAssetLibraryAfterJob(body.project_id, storedJob, { status: "failed", failure_reason: storedJob.failure_reason || "" });
-        saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
-      });
-    }
+    void resumeQueuedContinuousJobs(body.project_id).catch(() => {});
     return send(res, 200, { ok: true, job });
   }
 
@@ -3169,9 +3828,10 @@ async function handleApi(req, res) {
     const job = data.jobs.find((item) => item.job_id === body.job_id);
     if (!job) return send(res, 404, { ok: false, error: "找不到任务。" });
     if (job.status !== "rate_limited") return send(res, 400, { ok: false, error: "只有并发限制任务需要标记已处理。" });
+    if (job.platform === "jimeng_cli") return send(res, 400, { ok: false, error: "即梦并发限制不需要手动解除，等已有任务返回后会继续提交。" });
     job.status = "failed";
     job.rate_limit_handled = true;
-    job.failure_reason = "已在 Lovart 平台处理，可重新提交任务。";
+    job.failure_reason = rateLimitHandledReason(job);
     job.updated_at = now();
     saveProjectPart(body.project_id, "jobs.json", data.jobs);
     return send(res, 200, { ok: true, job });
@@ -3208,15 +3868,27 @@ if (require.main === module) {
 module.exports = {
   assetsFromLovartResult,
   assetTemplateOutputName,
+  blockingJobs,
   buildTags,
+  canStartQueuedJob,
   cleanGeneratedAssets,
   connectImageResultsToShotVideo,
   createProject,
+  defaultPromptFeedbackPresets,
+  deepSeekHttpErrorMessage,
+  extractJsonObject,
+  isJimengVipModel,
+  jobBlocksSubmission,
   loadProject,
+  normalizeDeepSeekBaseUrl,
+  normalizePromptOptimization,
   placeResultNodes,
+  saveScript,
   parseShotlistHtml,
   parseAssetLibraryJsonl,
   parseShots,
+  pruneDormantJobsForTarget,
+  rateLimitHandledReason,
   recordProcessedDownloads,
   safeName,
   uniquePath,

@@ -102,6 +102,33 @@
           </div>
         </section>
 
+        <section class="left-section collapsed" data-section-id="script-library">
+          <button class="section-toggle" data-toggle-section="script-library" aria-expanded="false">
+            <h2>剧本</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <p class="hint">导入或粘贴剧本，选中一小段后绑定到分镜。优化提示词时会自动带上绑定段落。</p>
+            <label class="file-button">
+              选择剧本 TXT / MD
+              <input id="scriptFile" type="file" accept=".txt,.md,.markdown" hidden>
+            </label>
+            <label class="field compact">
+              <span>剧本文本</span>
+              <textarea id="scriptSourceText" class="script-source-textarea" placeholder="粘贴剧本正文。选中一段后绑定到分镜。"></textarea>
+            </label>
+            <div class="script-bind-row">
+              <select id="scriptBindShot"></select>
+              <button id="bindSelectedScript">绑定选中段落</button>
+            </div>
+            <input id="scriptShotSearch" class="script-shot-search" type="text" placeholder="搜索分镜号、图片词或视频词">
+            <div id="scriptShotPreviewList" class="script-shot-preview-list"></div>
+            <button id="saveScriptSource">保存剧本</button>
+            <div id="scriptStatus" class="hint"></div>
+            <div id="scriptSegmentList" class="script-segment-list"></div>
+          </div>
+        </section>
+
         <section class="left-section collapsed" data-section-id="asset-library">
           <button class="section-toggle" data-toggle-section="asset-library" aria-expanded="false">
             <h2>资产素材库</h2>
@@ -139,6 +166,25 @@
             <input id="lovartSkillPath" type="text" placeholder="粘贴 lovart-skill 的 agent_skill.py 路径">
             <button id="saveLovartKey">保存 Lovart 配置</button>
             <div id="lovartKeyStatus" class="hint"></div>
+          </div>
+        </section>
+
+        <section class="left-section collapsed" data-section-id="deepseek-config">
+          <button class="section-toggle" data-toggle-section="deepseek-config" aria-expanded="false">
+            <h2>提示词优化配置</h2>
+            <span class="section-chevron">▾</span>
+          </button>
+          <div class="section-body">
+            <p class="hint">DeepSeek Key 只保存在本机，用来改写当前分镜的图片词和视频词。</p>
+            <label class="field compact checkbox-field">
+              <input id="deepseekEnabled" type="checkbox">
+              <span>启用提示词优化</span>
+            </label>
+            <input id="deepseekApiKey" type="password" placeholder="粘贴 DeepSeek API Key">
+            <input id="deepseekBaseUrl" type="text" placeholder="https://api.deepseek.com">
+            <input id="deepseekModel" type="text" placeholder="deepseek-chat">
+            <button id="saveDeepSeekConfig">保存优化配置</button>
+            <div id="deepseekStatus" class="hint"></div>
           </div>
         </section>
 
@@ -182,6 +228,8 @@
           <button data-context-add="videoGen">添加视频生成</button>
         </div>
       </section>
+
+      <div id="rightResizeHandle" class="panel-resize-handle right" aria-hidden="true"></div>
 
       <aside class="panel right">
         <div class="right-tabs">
@@ -306,6 +354,44 @@
               <button id="projectCreateConfirm" class="primary">创建并打开</button>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="promptOptimizerModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-prompt-optimizer></div>
+      <div class="modal-panel wide">
+        <div class="modal-header">
+          <strong id="promptOptimizerTitle">提示词优化</strong>
+          <button data-close-prompt-optimizer>关闭</button>
+        </div>
+        <div class="modal-body prompt-optimizer-body">
+          <label class="field">
+            <span>这次哪里不理想</span>
+            <textarea id="promptOptimizerFeedback" placeholder="例如：人物不像、动作太多、镜头不稳、不要增加新人物"></textarea>
+          </label>
+          <div id="promptFeedbackPresets" class="prompt-feedback-presets"></div>
+          <div class="prompt-feedback-config">
+            <button id="togglePromptFeedbackConfig" type="button">管理快捷反馈</button>
+            <div id="promptFeedbackConfigPanel" class="prompt-feedback-config-body" hidden>
+              <div class="prompt-feedback-add">
+                <input id="promptFeedbackPresetInput" type="text" placeholder="新增一个常用反馈">
+                <button id="addPromptFeedbackPreset">添加</button>
+              </div>
+              <div id="promptFeedbackPresetManage" class="prompt-feedback-manage"></div>
+              <button id="resetPromptFeedbackPresets">恢复默认</button>
+            </div>
+          </div>
+          <div class="prompt-optimizer-actions">
+            <button id="runPromptOptimizer" class="primary">生成优化建议</button>
+            <span id="promptOptimizerStatus" class="hint"></span>
+          </div>
+          <div id="promptOptimizerDiff" class="prompt-optimizer-diff" hidden></div>
+        </div>
+        <div class="modal-actions">
+          <button id="applyPromptImage">只应用图片词</button>
+          <button id="applyPromptVideo">只应用视频词</button>
+          <button id="applyPromptBoth" class="primary">应用到当前分镜</button>
         </div>
       </div>
     </div>
