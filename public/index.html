@@ -207,6 +207,7 @@
           <button id="toggleMarqueeMode">框选多选</button>
           <button id="connectMode">开始连线</button>
           <button id="bulkSubmitSelected">批量提交</button>
+          <button id="archiveSelected">归档选中</button>
           <button id="deleteEdge">删除连线</button>
           <button id="alignLeft">左对齐</button>
           <button id="alignTop">上对齐</button>
@@ -223,6 +224,7 @@
         <div id="canvas" class="canvas"></div>
         <div id="contextMenu" class="context-menu" hidden>
           <button data-context-add="text">添加文本</button>
+          <button data-context-add="globalControl">添加全局控制</button>
           <button data-context-add="memo">添加备忘录</button>
           <button data-context-add="imageGen">添加图片生成</button>
           <button data-context-add="videoGen">添加视频生成</button>
@@ -352,6 +354,19 @@
                 <input id="projectCreateName" placeholder="输入新项目名称">
               </label>
               <button id="projectCreateConfirm" class="primary">创建并打开</button>
+            </div>
+          </div>
+          <div class="reuse-package-panel">
+            <div>
+              <strong>项目复用包</strong>
+              <div class="hint">导出当前项目的标签、已绑定素材、素材库和全局控制模板；导入时创建一个干净新项目。</div>
+            </div>
+            <div class="reuse-package-actions">
+              <button id="exportReusePackage">导出当前项目复用包</button>
+              <label class="file-button compact">
+                导入复用包创建项目
+                <input id="reusePackageFile" type="file" accept=".aivideopack,.json,application/json" hidden>
+              </label>
             </div>
           </div>
         </div>

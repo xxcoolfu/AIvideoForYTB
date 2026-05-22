@@ -10,6 +10,7 @@ const {
   assetsFromLovartResult,
   assetTemplateOutputName,
   blockingJobs,
+  buildReferencePromptText,
   buildTags,
   canStartQueuedJob,
   cleanGeneratedAssets,
@@ -18,6 +19,8 @@ const {
   defaultPromptFeedbackPresets,
   deepSeekHttpErrorMessage,
   extractJsonObject,
+  exportProjectReusePackage,
+  importProjectReusePackage,
   isJimengVipModel,
   jobBlocksSubmission,
   loadProject,
@@ -74,6 +77,33 @@ result = tagRefsForPrompt("@Night Beach Camp — fog rolls in", [
   { label: "@Night Beach Camp", aliases: [] },
 ]);`, tagHelperContext);
 assert.deepEqual(tagHelperContext.result, ["@Night Beach Camp"]);
+const statusHelperSource = appSource.slice(appSource.indexOf("function statusInfoFromJob"), appSource.indexOf("function jobFailureReason"));
+const statusHelperContext = { result: null };
+vm.runInNewContext(`${statusHelperSource}
+result = statusInfoFromJob({ status: "running", platform: "lovart" });`, statusHelperContext);
+assert.equal(statusHelperContext.result.label, "提交中");
+vm.runInNewContext(`${statusHelperSource}
+result = statusInfoFromJob({ status: "running", platform: "lovart", lovart_thread_id: "thread_1" });`, statusHelperContext);
+assert.equal(statusHelperContext.result.label, "生成中");
+const lovartReferenceText = buildReferencePromptText("image", [
+  {
+    asset_kind: "image",
+    asset_name: "leo_father.png",
+    primary_tag_label: "@里奥父亲",
+    tag_labels: ["@里奥父亲"],
+    reference_role: "character_reference",
+  },
+  {
+    asset_kind: "image",
+    asset_name: "leo.png",
+    primary_tag_label: "@里奥",
+    tag_labels: ["@里奥"],
+    reference_role: "character_reference",
+  },
+]);
+assert.match(lovartReferenceText, /附件1 \/ 图片1 = @里奥父亲 \/ leo_father\.png（角色参考）/);
+assert.match(lovartReferenceText, /附件2 \/ 图片2 = @里奥 \/ leo\.png（角色参考）/);
+assert.ok(!lovartReferenceText.includes("角色1参考"));
 assert.equal(rateLimitHandledReason({ platform: "lovart" }), "Lovart 并发限制已标记为处理完成，可重新提交任务。");
 assert.equal(isJimengVipModel("seedance2.0fast_vip"), true);
 assert.equal(isJimengVipModel("seedance2.0fast"), false);
@@ -155,6 +185,33 @@ assert.equal(htmlShots[0].duration, "8s");
 assert.equal(htmlShots[0].size, "21:9");
 assert.equal(htmlShots[0].video_model, "generate_video_seedance_v2_0_fast");
 
+const modelAwareHtmlShots = parseShotlistHtml(`
+  <h2 class="block-title">Episode 7</h2>
+  <tr data-scene="1" data-plan="CU">
+    <td class="c-num">01</td>
+    <td><span>CU</span></td>
+    <td class="c-model"><span class="field-pill">Kling3 Omni</span></td>
+    <td class="c-link"><span class="link-pill">视频直出</span></td>
+    <td class="c-prompt"><div class="prompt-head"><b>提示词 1</b></div><div class="prompt-block">@里奥 close beat.
+7秒。21:9。</div></td>
+  </tr>
+  <tr data-scene="1" data-plan="PAN">
+    <td class="c-num">02</td>
+    <td><span>PAN</span></td>
+    <td class="c-model"><span class="field-pill">Seedance2.0</span></td>
+    <td class="c-link"><span class="link-pill">接上一尾帧</span></td>
+    <td class="c-prompt"><div class="prompt-head"><b>提示词 2</b></div><div class="prompt-block">@外围药草地 action chain.
+8秒。21:9。</div></td>
+  </tr>
+`, "jimeng_cli");
+assert.equal(modelAwareHtmlShots[0].video_model, "generate_video_kling_v3_omni");
+assert.equal(modelAwareHtmlShots[0].platform, "lovart");
+assert.equal(modelAwareHtmlShots[0].transition, "video_direct");
+assert.equal(modelAwareHtmlShots[1].video_model, "seedance2.0");
+assert.equal(modelAwareHtmlShots[1].platform, "jimeng_cli");
+assert.equal(modelAwareHtmlShots[1].transition, "continue_prev_tail");
+assert.equal(modelAwareHtmlShots[1].expected_prev_shot_id, "分镜7-1-1");
+
 const sectionHtmlShots = parseShotlistHtml(`
   <h2 class="block-title">Episode 1 — Fog Island</h2>
   <section class="scene" id="sc9">
@@ -196,6 +253,42 @@ assert.ok(Array.isArray(loaded.canvas.nodes));
 assert.ok(Array.isArray(loaded.prompt_context.learnings));
 assert.deepEqual(loaded.prompt_context.feedback_presets, defaultPromptFeedbackPresets());
 assert.ok(Array.isArray(loaded.script.segments));
+
+const reusableFile = path.join(__dirname, "projects", "测试项目", "input", "里奥.png");
+fs.writeFileSync(reusableFile, "reusable image");
+fs.writeFileSync(path.join(__dirname, "projects", "测试项目", "canvas.json"), JSON.stringify({
+  nodes: [
+    { id: "control_1", type: "globalControl", x: 10, y: 20, data: { title: "统一风格", text: "cinematic light" } },
+    { id: "done_1", type: "image", x: 300, y: 20, data: { asset_id: "asset_generated" } },
+  ],
+  edges: [],
+  assets: [
+    { asset_id: "asset_reuse", name: "里奥", kind: "image", source: "input", is_library_asset: true, asset_category: "character", file_path: reusableFile },
+    { asset_id: "asset_generated", name: "旧成品", kind: "image", source: "generated" },
+  ],
+}, null, 2));
+fs.writeFileSync(path.join(__dirname, "projects", "测试项目", "tags.json"), JSON.stringify([
+  { tag_id: "tag_leo", label: "@里奥", referenced_by_shot_ids: ["1"], bound_asset_ids: ["asset_reuse"] },
+], null, 2));
+fs.writeFileSync(path.join(__dirname, "projects", "测试项目", "asset_library.json"), JSON.stringify({
+  global_rules: "reuse rules",
+  image_model: "agent-auto",
+  templates: [{ template_id: "tpl_1", name: "角色模板" }],
+}, null, 2));
+fs.writeFileSync(path.join(__dirname, "projects", "测试项目", "jobs.json"), JSON.stringify([{ job_id: "old_job", status: "downloaded" }], null, 2));
+fs.writeFileSync(path.join(__dirname, "projects", "测试项目", "shots.json"), JSON.stringify([{ shot_id: "1" }], null, 2));
+const reusePack = exportProjectReusePackage("测试项目");
+assert.equal(reusePack.package_type, "ai_video_reuse_pack");
+assert.ok(reusePack.assets.some((asset) => asset.asset_id === "asset_reuse"));
+assert.ok(!reusePack.assets.some((asset) => asset.asset_id === "asset_generated"));
+assert.equal(reusePack.files.length, 1);
+assert.equal(reusePack.global_controls.length, 1);
+const importedReuse = importProjectReusePackage(reusePack, "复用包导入测试");
+assert.equal(importedReuse.jobs.length, 0);
+assert.equal(importedReuse.shots.length, 0);
+assert.equal(importedReuse.canvas.nodes.filter((node) => node.type === "globalControl").length, 1);
+assert.equal(importedReuse.tags[0].bound_asset_ids[0], "asset_reuse");
+assert.ok(fs.existsSync(importedReuse.canvas.assets[0].file_path));
 
 const savedScript = saveScript("测试项目", {
   source_text: "第一场\n角色进入门诊室。",

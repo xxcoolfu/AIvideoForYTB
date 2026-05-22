@@ -5,14 +5,18 @@ const state = {
   shots: [],
   tags: [],
   jobs: [],
+  archives: [],
   assetLibrary: { global_rules: "", templates: [], image_model: "agent-auto" },
   promptContext: { learnings: [], feedback_presets: [] },
   script: { source_text: "", segments: [], bindings: [] },
   scriptSelection: { text: "", start: 0, end: 0 },
   selectedNodeId: null,
   selectedNodeIds: [],
+  openTagIds: [],
   openShotIds: [],
+  openShotParamIds: [],
   openJobIds: [],
+  openJobSubdetailIds: [],
   selectedEdgeId: null,
   connectSourceId: null,
   connectSourceIds: [],
@@ -50,6 +54,7 @@ const state = {
   canvasDirty: false,
   inspectorEditing: false,
   lastInspectorInputAt: 0,
+  lastPanelInteractionAt: 0,
   jobActionLocks: new Set(),
   bulkSubmit: {
     active: false,
@@ -272,7 +277,10 @@ function fitTextareaToContent(textarea) {
 }
 
 function fitShotPromptTextareas(root = document) {
+  const panel = root.closest?.(".panel") || $("#shotTable")?.closest(".panel") || null;
+  const scrollTop = panel?.scrollTop || 0;
   root.querySelectorAll(".shot-prompt-textarea").forEach(fitTextareaToContent);
+  if (panel && !isEditingElement(document.activeElement)) panel.scrollTop = scrollTop;
 }
 
 function leftPanelWidth() {
@@ -347,6 +355,7 @@ function formatBytes(bytes) {
 }
 
 function nodeTitle(node) {
+  if (node.type === "globalControl") return node.data.title || "全局控制";
   if (node.type === "text") return node.data.title || "文本";
   if (node.type === "memo") return node.data.title || "备忘录";
   if (node.type === "image") return node.data.title || "图片素材";
@@ -505,6 +514,31 @@ function rememberOpenId(listName, id, open) {
     : current.filter((item) => item !== id);
 }
 
+function markPanelInteraction() {
+  state.lastPanelInteractionAt = Date.now();
+}
+
+function panelRecentlyActive(windowMs = 3000) {
+  return Date.now() - (state.lastPanelInteractionAt || 0) < windowMs;
+}
+
+function panelScrollSnapshot() {
+  return [".panel.left", ".panel.right"].map((selector) => {
+    const el = document.querySelector(selector);
+    return el ? { selector, top: el.scrollTop, left: el.scrollLeft } : null;
+  }).filter(Boolean);
+}
+
+function restorePanelScroll(snapshot = []) {
+  if (isEditingElement(document.activeElement)) return;
+  for (const item of snapshot) {
+    const el = document.querySelector(item.selector);
+    if (!el) continue;
+    el.scrollTop = item.top;
+    el.scrollLeft = item.left;
+  }
+}
+
 function marqueeScreenRect() {
   if (!state.marquee) return null;
   const rect = canvasEl.getBoundingClientRect();
@@ -596,6 +630,9 @@ function bulkSubmitStateText() {
   const pending = bulk.queue.length;
   const active = activeLovartJobCount();
   if (!bulk.active) return "";
+  if (state.project?.queue_paused) {
+    return `任务队列已暂停：已登记 ${bulk.submitted}/${bulk.total}，待登记 ${pending}。恢复提交后会按平台限制继续。`;
+  }
   if (bulk.currentJobId) {
     return `批量提交中：已登记 ${bulk.submitted}/${bulk.total}，待登记 ${pending}，Lovart 单通道提交，平台活跃 ${active}/${BULK_SUBMIT_LOVART_ACTIVE_LIMIT}`;
   }
@@ -687,6 +724,18 @@ async function startBulkSubmitSelected() {
   const nodes = selectedGeneratorNodes();
   if (!nodes.length) {
     setStatus("先选中要批量提交的图片/视频生成节点。", "bad");
+    return;
+  }
+  const tagBlockMessage = tagBindingBlockMessage();
+  if (tagBlockMessage) {
+    showTagBindingBlock(tagBlockMessage);
+    renderToolbarState();
+    return;
+  }
+  const controlBlockMessage = globalControlBlockMessage(nodes);
+  if (controlBlockMessage) {
+    setStatus(controlBlockMessage, "bad");
+    renderToolbarState();
     return;
   }
   const existing = new Set([
@@ -827,6 +876,7 @@ function distributeSelectedNodes(axis) {
 
 function nodeTypeLabel(type) {
   return {
+    globalControl: "全局控制",
     text: "提示词输入",
     memo: "项目备忘",
     image: "图片参考",
@@ -1004,6 +1054,7 @@ function addNode(type, data = {}, position = null, options = {}) {
 }
 
 function defaultNodeData(type) {
+  if (type === "globalControl") return { title: "全局控制", text: "" };
   if (type === "text") return { title: "文本", text: "" };
   if (type === "memo") return { title: "备忘录", html: "<div>记录这次尝试、问题和结论。</div>" };
   return {};
@@ -1426,24 +1477,21 @@ function referenceRoleLabel(role) {
 }
 
 function buildNumberedReferenceLabels(items = []) {
-  const counters = {};
+  const mediaCounters = { image: 0, video: 0, audio: 0, file: 0 };
   return items.map((item, index) => {
-    const role = item.reference_role || "reference";
-    counters[role] = (counters[role] || 0) + 1;
-    const identity = item.primary_tag_label || item.asset_name;
+    const kind = item.asset?.kind || item.asset_kind || "image";
+    const mediaKey = kind === "video" ? "video" : kind === "audio" ? "audio" : kind === "image" ? "image" : "file";
+    mediaCounters[mediaKey] += 1;
+    const mediaLabel = mediaKey === "image"
+      ? `图片${mediaCounters[mediaKey]}`
+      : mediaKey === "video"
+        ? `视频${mediaCounters[mediaKey]}`
+        : mediaKey === "audio"
+          ? `音频${mediaCounters[mediaKey]}`
+          : `文件${mediaCounters[mediaKey]}`;
+    const identity = item.primary_tag_label || item.asset_name || mediaLabel;
     const alias = item.asset_name !== identity ? ` / ${item.asset_name}` : "";
-    const roleText = role === "character_reference"
-      ? `角色${counters[role]}参考`
-      : role === "scene_reference"
-        ? `场景${counters[role]}参考`
-        : role === "prop_reference"
-          ? `道具${counters[role]}参考`
-          : role === "motion_reference"
-            ? `运动参考${counters[role]}`
-            : role === "reference"
-              ? `普通参考${counters[role]}`
-              : referenceRoleLabel(role);
-    return `附件${index + 1}（${identity}${alias}）= ${roleText}`;
+    return `附件${index + 1} / ${mediaLabel} = ${identity}${alias}（${referenceRoleLabel(item.reference_role || "reference")}）`;
   });
 }
 
@@ -1540,6 +1588,25 @@ function normalizeReferenceRoles(items, kind, feature) {
 
 function libraryAssets() {
   return state.canvas.assets.filter((asset) => asset.is_library_asset);
+}
+
+function projectTagsMissingBindings() {
+  return (state.tags || []).filter((tag) => !(tag.bound_asset_ids || []).length);
+}
+
+function tagBindingBlockMessage(missingTags = projectTagsMissingBindings()) {
+  if (!missingTags.length) return "";
+  const preview = missingTags.slice(0, 5).map((tag) => tag.label).join("、");
+  const suffix = missingTags.length > 5 ? " 等" : "";
+  return `还有 ${missingTags.length} 个项目标签没绑定资产：${preview}${suffix}。先在“项目标签”完成绑定，再提交生成。`;
+}
+
+function showTagBindingBlock(message = tagBindingBlockMessage()) {
+  if (!message) return false;
+  ensureLeftSectionExpanded("project-tags");
+  scrollToLeftSection("project-tags");
+  setStatus(message, "bad");
+  return true;
 }
 
 const LEFT_SECTION_KEY = "ai-video-left-sections";
@@ -1646,7 +1713,7 @@ function collectSubmissionInputs(nodeId) {
   for (const edge of incoming) {
     const source = state.canvas.nodes.find((node) => node.id === edge.source);
     if (!source) continue;
-    if (source.type === "text") promptParts.push(source.data?.text || "");
+    if (["globalControl", "text"].includes(source.type)) promptParts.push(source.data?.text || "");
     if (source.data?.asset_id && !seenAssetIds.has(source.data.asset_id)) {
       seenAssetIds.add(source.data.asset_id);
       assetInputs.push({
@@ -1663,6 +1730,25 @@ function collectSubmissionInputs(nodeId) {
     assetIds: assetInputs.map((item) => item.asset_id),
     assetInputs,
   };
+}
+
+function globalControlNodesForGenerator(nodeId) {
+  const incoming = state.canvas.edges.filter((edge) => edge.target === nodeId);
+  return incoming
+    .map((edge) => state.canvas.nodes.find((node) => node.id === edge.source))
+    .filter((node) => node?.type === "globalControl");
+}
+
+function generatorsMissingGlobalControl(nodes = selectedGeneratorNodes()) {
+  return (nodes || []).filter((node) => isGeneratorNode(node) && !globalControlNodesForGenerator(node.id).length);
+}
+
+function globalControlBlockMessage(nodes = selectedGeneratorNodes()) {
+  const missing = generatorsMissingGlobalControl(nodes);
+  if (!missing.length) return "";
+  const preview = missing.slice(0, 4).map((node) => nodeTitle(node)).join("、");
+  const suffix = missing.length > 4 ? " 等" : "";
+  return `还有 ${missing.length} 个生成节点没有连接“全局控制”：${preview}${suffix}。先添加全局控制节点并连到生成节点，再提交生成。`;
 }
 
 function buildSubmissionPreview(node) {
@@ -1711,13 +1797,13 @@ function buildSubmissionPreview(node) {
             "参考素材附件说明（提交时会上传成附件）:",
             ...attachmentLines,
             kind === "image"
-              ? "请按上面的附件身份使用参考图，不要忽略附件，也不要混淆角色、场景和道具。"
+              ? "请按上面的附件编号和图片编号使用参考图，不要忽略附件，也不要混淆角色、场景和道具。"
               : [
                   params.feature === "first_frame" || assets.some((item) => item.reference_role === "first_frame")
                     ? "请严格使用被标记为“首帧参考”的附件作为起始画面。"
                     : "",
                   "角色参考只用于角色一致性，场景参考只用于空间与布光，道具参考只用于物体细节。",
-                  "不要混淆各附件用途；若模型无法遵守，请直接说明具体原因。",
+                  "不要混淆各附件编号、图片编号和用途；若模型无法遵守，请直接说明具体原因。",
                 ].filter(Boolean).join(" "),
           ].join("\n")
     )
@@ -2006,6 +2092,65 @@ async function deleteNode(nodeId = state.selectedNodeId, force = false) {
   setStatus(`已删除节点：${node ? nodeTitle(node) : nodeId}`, "ok");
 }
 
+function applyProjectStatePayload(data = {}) {
+  if (data.canvas) state.canvas = data.canvas;
+  if (data.shots) state.shots = sanitizeShotsForState(data.shots || []);
+  if (data.tags) state.tags = rebuildTagsFromShots(data.tags || []);
+  if (data.jobs) state.jobs = data.jobs || [];
+  if (data.archives) state.archives = Array.isArray(data.archives) ? data.archives : [];
+  if (data.asset_library) state.assetLibrary = data.asset_library || state.assetLibrary;
+  if (data.prompt_context) state.promptContext = normalizePromptContextForState(data.prompt_context || {});
+  if (data.script) state.script = normalizeScriptForState(data.script || {});
+}
+
+async function archiveSelectedNodes() {
+  const ids = selectedNodeIds();
+  if (!ids.length) {
+    setStatus("先选中要归档的分镜节点。", "bad");
+    return;
+  }
+  const ok = window.confirm(`归档会把选中的 ${ids.length} 个节点及相关分镜从当前画布移出，但不会删除本地生成文件。之后可在项目复盘里恢复。`);
+  if (!ok) return;
+  await saveCanvas({ silent: true });
+  const result = await api("/api/archive/selected", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, node_ids: ids }),
+  });
+  if (!result.ok) {
+    setStatus(result.error || "归档失败。", "bad");
+    return;
+  }
+  applyProjectStatePayload(result);
+  clearNodeSelection();
+  clearConnectSources();
+  state.selectedEdgeId = null;
+  state.canvasDirty = false;
+  clearCanvasDraft();
+  render();
+  const archive = result.archive || {};
+  setStatus(`已归档：${archive.title || "选中内容"}。当前画布已移出 ${archive.counts?.nodes || 0} 个节点。`, "ok");
+}
+
+async function restoreArchive(archiveId) {
+  if (!archiveId) return;
+  const result = await api("/api/archive/restore", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, archive_id: archiveId }),
+  });
+  if (!result.ok) {
+    setStatus(result.error || "恢复归档失败。", "bad");
+    return;
+  }
+  applyProjectStatePayload(result);
+  clearNodeSelection();
+  clearConnectSources();
+  state.selectedEdgeId = null;
+  state.canvasDirty = false;
+  clearCanvasDraft();
+  render();
+  setStatus(`已恢复归档：${result.archive?.title || archiveId}。`, "ok");
+}
+
 async function deleteEdge(edgeId = state.selectedEdgeId, force = false) {
   if (!edgeId) return;
   if (!force && state.pendingDeleteEdgeId !== edgeId) {
@@ -2288,14 +2433,16 @@ function renderNode(node) {
       (selectedIdSet.has(edge.source) && edge.target === node.id)
       || (selectedIdSet.has(edge.target) && edge.source === node.id)
     );
-  el.className = `node ${isNodeSelected(node.id) ? "selected" : ""} ${connectedToSelected ? "connected" : ""}`;
+  el.className = `node node-${node.type} ${isNodeSelected(node.id) ? "selected" : ""} ${connectedToSelected ? "connected" : ""}`;
   el.style.left = `${node.x}px`;
   el.style.top = `${node.y}px`;
   el.dataset.id = node.id;
 
   const asset = node.data.asset_id ? assetById(node.data.asset_id) : null;
   let body = "";
-  if (node.type === "text") {
+  if (node.type === "globalControl") {
+    body = `<div>${escapeHtml((node.data.text || "在右侧填写全局控制词，并连到生成节点").slice(0, 100))}</div>`;
+  } else if (node.type === "text") {
     body = `<div>${escapeHtml((node.data.text || "双击右侧面板填写提示词").slice(0, 90))}</div>`;
   } else if (node.type === "memo") {
     body = `<div class="memo-preview">${escapeHtml(memoPlainPreview(node))}</div>`;
@@ -2605,7 +2752,11 @@ function renderToolbarState() {
   const toggle = $("#toggleMarqueeMode");
   if (toggle) toggle.classList.toggle("active", state.selectionMode);
   const selectedCount = selectedNodeIds().length;
-  const selectedGeneratorCount = selectedGeneratorNodes().length;
+  const selectedGenerators = selectedGeneratorNodes();
+  const selectedGeneratorCount = selectedGenerators.length;
+  const tagBlockMessage = tagBindingBlockMessage();
+  const controlBlockMessage = selectedGeneratorCount ? globalControlBlockMessage(selectedGenerators) : "";
+  const submitBlockMessage = tagBlockMessage || controlBlockMessage;
   ["#alignLeft", "#alignTop"].forEach((selector) => {
     const button = $(selector);
     if (button) button.disabled = selectedCount < 2;
@@ -2614,10 +2765,16 @@ function renderToolbarState() {
     const button = $(selector);
     if (button) button.disabled = selectedCount < 3;
   });
+  const archiveButton = $("#archiveSelected");
+  if (archiveButton) {
+    archiveButton.disabled = !selectedCount;
+    archiveButton.textContent = selectedCount ? `归档选中 ${selectedCount}` : "归档选中";
+  }
   const bulkButton = $("#bulkSubmitSelected");
   if (bulkButton) {
-    bulkButton.disabled = !selectedGeneratorCount || state.bulkSubmit.processing;
+    bulkButton.disabled = !selectedGeneratorCount || state.bulkSubmit.processing || Boolean(submitBlockMessage);
     bulkButton.classList.toggle("active", state.bulkSubmit.active);
+    bulkButton.title = submitBlockMessage || "";
     bulkButton.textContent = state.bulkSubmit.active
       ? `批量队列 ${state.bulkSubmit.queue.length}`
       : selectedGeneratorCount > 1
@@ -2628,6 +2785,8 @@ function renderToolbarState() {
   if (bulkStatus) {
     if (state.bulkSubmit.active) {
       bulkStatus.textContent = bulkSubmitStateText();
+    } else if (submitBlockMessage && selectedGeneratorCount) {
+      bulkStatus.textContent = submitBlockMessage;
     } else if (selectedGeneratorCount) {
       bulkStatus.textContent = `已选 ${selectedGeneratorCount} 个生成节点`;
     } else {
@@ -2656,12 +2815,13 @@ function renderTags() {
     <div class="tag-summary">
       <span>标签 ${sortedTags.length}</span>
       <span class="${unboundCount ? "bad" : "ok"}">${unboundCount ? `待绑定 ${unboundCount}` : "已全部绑定"}</span>
+      <button id="autoBindTagsByName" ${unboundCount ? "" : "disabled"}>自动绑定同名资产</button>
     </div>
   ` + sortedTags.map((tag) => {
     const boundNames = (tag.bound_asset_ids || []).map((id) => assetById(id)?.name).filter(Boolean);
     const hasBindings = boundNames.length > 0;
     return `
-      <details class="tag-card" ${!hasBindings ? "open" : ""}>
+      <details class="tag-card" data-tag-detail="${escapeHtml(tag.tag_id)}" ${(!hasBindings || state.openTagIds.includes(tag.tag_id)) ? "open" : ""}>
         <summary>
           <strong>${escapeHtml(tag.label)}</strong>
           <span class="shot-status-row">
@@ -2686,6 +2846,11 @@ function renderTags() {
   box.querySelectorAll("[data-open-tag-picker]").forEach((button) => {
     button.addEventListener("click", () => openTagPicker(button.dataset.openTagPicker));
   });
+  box.querySelectorAll("[data-tag-detail]").forEach((detail) => {
+    detail.addEventListener("toggle", () => {
+      rememberOpenId("openTagIds", detail.dataset.tagDetail, detail.open);
+    });
+  });
   box.querySelectorAll("[data-tag-aliases]").forEach((input) => {
     const save = async () => {
       const tag = state.tags.find((item) => item.tag_id === input.dataset.tagAliases);
@@ -2700,6 +2865,61 @@ function renderTags() {
   box.querySelectorAll("[data-normalize-tag]").forEach((button) => {
     button.addEventListener("click", () => normalizeTagAcrossShots(button.dataset.normalizeTag));
   });
+  $("#autoBindTagsByName")?.addEventListener("click", () => autoBindTagsByExactAssetName().catch((error) => {
+    setStatus(`自动绑定失败：${error.message}`, "bad");
+  }));
+}
+
+async function autoBindTagsByExactAssetName() {
+  const assetsByName = new Map();
+  for (const asset of libraryAssets()) {
+    const name = String(asset.name || "").trim();
+    if (!name) continue;
+    const list = assetsByName.get(name) || [];
+    list.push(asset);
+    assetsByName.set(name, list);
+  }
+
+  let changedCount = 0;
+  const conflicts = [];
+  const missing = [];
+  const nextTags = state.tags.map((tag) => {
+    if ((tag.bound_asset_ids || []).length) return tag;
+    const label = String(tag.label || "").trim();
+    const matches = assetsByName.get(label) || [];
+    if (matches.length === 1) {
+      changedCount += 1;
+      return { ...tag, bound_asset_ids: [matches[0].asset_id] };
+    }
+    if (matches.length > 1) conflicts.push({ label, count: matches.length });
+    else missing.push(label);
+    return tag;
+  });
+
+  if (!changedCount && !conflicts.length) {
+    setStatus(missing.length ? "没有找到名称完全相同的未绑定资产。" : "当前没有需要自动绑定的标签。", "bad");
+    return;
+  }
+
+  if (changedCount) {
+    state.tags = nextTags;
+    await api("/api/tags/save", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, tags: state.tags }),
+    });
+  }
+
+  renderTags();
+  renderToolbarState();
+  renderInspector();
+
+  if (conflicts.length) {
+    const detail = conflicts.map((item) => `${item.label}（${item.count} 个同名资产）`).join("\n");
+    alert(`这些标签找到多个同名资产，已跳过，请手动选择：\n${detail}`);
+  }
+  const conflictText = conflicts.length ? `；${conflicts.length} 个标签有多个同名资产，已跳过` : "";
+  const statusKind = conflicts.length && !changedCount ? "bad" : "ok";
+  setStatus(changedCount ? `已自动绑定 ${changedCount} 个标签${conflictText}。` : `没有自动绑定；${conflicts.length} 个标签有多个同名资产，已跳过。`, statusKind);
 }
 
 function renderTagPickerPreview(asset) {
@@ -2769,6 +2989,58 @@ async function createProjectFromPicker() {
   await loadProject(name);
 }
 
+function downloadJsonFile(fileName, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function exportReusePackage() {
+  await saveCanvas({ silent: true });
+  const result = await api(`/api/project/reuse-package?project_id=${encodeURIComponent(state.projectId)}`);
+  if (!result.ok) {
+    setStatus(result.error || "导出项目复用包失败。", "bad");
+    return;
+  }
+  const pack = result.package;
+  const fileName = `${state.projectId}_项目复用包.aivideopack`;
+  downloadJsonFile(fileName, pack);
+  const missing = pack.missing_files?.length ? `；${pack.missing_files.length} 个素材缺少本地文件，已只保留记录` : "";
+  setStatus(`已导出项目复用包：${pack.assets?.length || 0} 个素材，${pack.tags?.length || 0} 个标签，${pack.global_controls?.length || 0} 个全局控制${missing}。`, "ok");
+}
+
+async function importReusePackageFile(file) {
+  const text = await file.text();
+  let pack;
+  try {
+    pack = JSON.parse(text);
+  } catch {
+    setStatus("复用包文件无法读取，请确认是导出的 .aivideopack 文件。", "bad");
+    return;
+  }
+  const defaultName = `${pack.source_project?.name || "复用项目"}_复用`;
+  const name = window.prompt("新项目名称", defaultName);
+  if (!name) return;
+  const result = await api("/api/project/import-reuse-package", {
+    method: "POST",
+    body: JSON.stringify({ name, package: pack }),
+  });
+  if (result.ok === false) {
+    setStatus(result.error || "导入项目复用包失败。", "bad");
+    return;
+  }
+  closeProjectPicker();
+  state.projectId = result.project?.project_id || result.project_id || name;
+  await loadProject(state.projectId);
+  setStatus(`已从复用包创建新项目：${state.projectId}。旧任务记录和完成节点没有复制。`, "ok");
+}
+
 function renderTagPicker() {
   const tag = state.tags.find((item) => item.tag_id === state.pendingTagPickerTagId);
   const list = $("#tagPickerList");
@@ -2830,6 +3102,8 @@ async function saveTagPicker() {
   });
   closeTagPicker();
   renderTags();
+  renderToolbarState();
+  renderInspector();
   setStatus(`${tag.label} 的资产绑定已保存。`, "ok");
 }
 
@@ -3033,6 +3307,13 @@ function statusInfoFromJob(job) {
   if (job.last_lovart_reply_status === "sending") {
     return { label: "回复中", tone: "running", job };
   }
+  if (
+    job.status === "running"
+    && !job.lovart_thread_id
+    && !job.jimeng_submit_id
+  ) {
+    return { label: "提交中", tone: "running", job };
+  }
   if (job.status === "running" && job.last_lovart_reply) {
     return { label: "已回复·生成中", tone: "running", job };
   }
@@ -3185,7 +3466,7 @@ function renderShotTable() {
         <span>模型：${escapeHtml(shotModelLabel(shot.video_model))}</span>
         ${shot.duration ? `<span>时长：${escapeHtml(shot.duration)}</span>` : ""}
       </div>
-      <details class="shot-params">
+      <details class="shot-params" data-shot-param-detail="${escapeHtml(shot.shot_id)}" ${state.openShotParamIds.includes(shot.shot_id) ? "open" : ""}>
         <summary>修改分镜参数</summary>
         <div class="shot-inline-fields shot-inline-fields-wide">
         <label class="field"><span>分镜号</span><input data-shot-index="${index}" data-shot-field="shot_id" value="${escapeHtml(shot.shot_id)}"></label>
@@ -3266,6 +3547,11 @@ function renderShotTable() {
     detail.addEventListener("toggle", () => {
       rememberOpenId("openShotIds", detail.dataset.shotDetail, detail.open);
       if (detail.open) requestAnimationFrame(() => fitShotPromptTextareas(detail));
+    });
+  });
+  box.querySelectorAll("[data-shot-param-detail]").forEach((detail) => {
+    detail.addEventListener("toggle", () => {
+      rememberOpenId("openShotParamIds", detail.dataset.shotParamDetail, detail.open);
     });
   });
 
@@ -4195,17 +4481,21 @@ function renderInspector() {
   }
 
   const isGenerator = ["imageGen", "videoGen"].includes(node.type);
+  const isGlobalControl = node.type === "globalControl";
   const isMemo = node.type === "memo";
   const videoAsset = videoAssetForNode(node);
   const currentGeneratorParams = isGenerator ? generatorParameters(node.data || {}) : {};
   const generatorParams = isGenerator ? renderGeneratorFields(node) : "";
   const referenceAssetFields = isGenerator ? renderReferenceAssetFields(node) : "";
   const submitPreview = isGenerator ? buildSubmissionPreview(node) : null;
+  const tagBlockMessage = isGenerator ? tagBindingBlockMessage() : "";
+  const controlBlockMessage = isGenerator ? globalControlBlockMessage([node]) : "";
+  const submitBlockMessage = tagBlockMessage || controlBlockMessage;
   const generatorSummary = isGenerator
     ? `<div class="hint">平台：${escapeHtml(platformLabel(node.data?.platform))} · 当前设置：${escapeHtml(formatGeneratorParameters(currentGeneratorParams) || "未设置")}</div>`
     : "";
   const submitButton = isGenerator
-    ? `<button class="primary" id="submitGeneration">${state.pendingForceSubmitNodeId === node.id ? "仍然提交一条" : "提交生成任务"}</button><div id="submitFeedback" class="inline-feedback"></div>`
+    ? `<button class="primary" id="submitGeneration" ${submitBlockMessage ? "disabled" : ""}>${state.pendingForceSubmitNodeId === node.id ? "仍然提交一条" : "提交生成任务"}</button><div id="submitFeedback" class="inline-feedback ${submitBlockMessage ? "bad" : ""}">${escapeHtml(submitBlockMessage)}</div>`
     : "";
   const optimizerButton = isGenerator
     ? `<button id="openNodePromptOptimizer">提示词优化</button>`
@@ -4213,8 +4503,8 @@ function renderInspector() {
   const videoTools = videoAsset
     ? `<button id="openVideoPreview">放大预览</button><button id="captureLastFrame">提取静帧</button>`
     : "";
-  const promptField = ["text", "imageGen", "videoGen"].includes(node.type)
-    ? `<label class="field"><span>${node.type === "text" ? "文本提示词" : "补充提示词"}</span><textarea id="nodeText" class="node-prompt-textarea">${escapeHtml(node.type === "text" ? node.data.text || "" : node.data.prompt || "")}</textarea></label>`
+  const promptField = ["globalControl", "text", "imageGen", "videoGen"].includes(node.type)
+    ? `<label class="field"><span>${isGlobalControl ? "全局控制词" : node.type === "text" ? "文本提示词" : "补充提示词"}</span><textarea id="nodeText" class="node-prompt-textarea">${escapeHtml(isGlobalControl || node.type === "text" ? node.data.text || "" : node.data.prompt || "")}</textarea></label>`
     : "";
   const memoField = isMemo ? `
     <div class="field">
@@ -4307,7 +4597,7 @@ function renderInspector() {
   if (text) {
     fitTextareaToContent(text);
     text.addEventListener("input", (event) => {
-      patchNodeData(node.id, node.type === "text" ? { text: event.target.value } : { prompt: event.target.value });
+      patchNodeData(node.id, ["globalControl", "text"].includes(node.type) ? { text: event.target.value } : { prompt: event.target.value });
       fitTextareaToContent(text);
     });
     text.addEventListener("blur", () => renderCanvasOnly());
@@ -4369,7 +4659,7 @@ function renderInspector() {
   const deleteAssetButton = $("#deleteAssetFromNode");
   if (deleteAssetButton) deleteAssetButton.addEventListener("click", () => deleteAsset(node.data.asset_id));
   const submit = $("#submitGeneration");
-  if (submit) submit.addEventListener("click", () => submitGeneration(node.id, submit));
+  if (submit && !submit.disabled) submit.addEventListener("click", () => submitGeneration(node.id, submit));
   $("#openNodePromptOptimizer")?.addEventListener("click", () => openPromptOptimizer({ type: "node", nodeId: node.id }));
 }
 
@@ -4465,7 +4755,7 @@ function renderGeneratorFields(node) {
       ${isJimengVideo ? `
         <label class="field compact generator-field-half"><span>视频模式</span><select id="paramMode">${jimengModeOptions}</select></label>
         <label class="field compact generator-field-half"><span>分辨率</span><select id="paramResolution">${jimengResolutionOptions}</select></label>
-        ${jimengMode === "multimodal2video" ? `<div class="hint generator-field-wide">这条可接多张图片、视频、音频。至少一张图片或一个视频；如果连的是 URL 素材，提交时会先转成本地文件再交给即梦。</div>` : ""}
+        ${jimengMode === "multimodal2video" ? `<div class="hint generator-field-wide">这条可接多张图片、视频、音频。至少一张图片或一个视频；图片最多 9 张，提交时会使用本地轻量上传副本。</div>` : ""}
       ` : isJimengImage ? `
         <label class="field compact generator-field-half"><span>图片模式</span><select id="paramMode">${jimengImageModeOptionsHtml}</select></label>
         <label class="field compact generator-field-half"><span>分辨率</span><select id="paramResolution">${jimengImageResolutionOptionsHtml}</select></label>
@@ -4702,15 +4992,29 @@ function bindGeneratorFields(node) {
 function renderJobs() {
   const box = $("#jobList");
   if (!state.jobs.length) {
-    box.innerHTML = `<p class="hint">还没有任务。先提一条图片或视频生成任务。</p>`;
+    const queuePaused = Boolean(state.project?.queue_paused);
+    box.innerHTML = `
+      <div class="job-summary">
+        <span>任务 0</span>
+        ${queuePaused ? `<span class="bad">提交已暂停</span>` : ""}
+        <button type="button" class="job-summary-action ${queuePaused ? "primary" : ""}" id="toggleQueuePause">${queuePaused ? "恢复提交" : "暂停提交"}</button>
+      </div>
+      ${queuePaused ? `<div class="job-auto-query bad">新任务会登记为待提交；恢复提交后再送到平台。</div>` : ""}
+      <p class="hint">还没有任务。先提一条图片或视频生成任务。</p>
+    `;
+    $("#toggleQueuePause")?.addEventListener("click", () => {
+      toggleQueuePause().catch((error) => setStatus(error.message, "bad"));
+    });
     return;
   }
   const jobs = state.jobs.slice().reverse();
   const queryableRunning = runningJobsForAutoRefresh();
   const queryStatus = autoQuerySummary();
+  const queuePaused = Boolean(state.project?.queue_paused);
   const summary = {
     total: jobs.length,
-    running: jobs.filter((job) => job.status === "running").length,
+    submitting: jobs.filter((job) => job.status === "running" && !job.lovart_thread_id && !job.jimeng_submit_id).length,
+    running: jobs.filter((job) => job.status === "running" && (job.lovart_thread_id || job.jimeng_submit_id)).length,
     blocked: jobs.filter((job) => ["needs_input", "pending_confirmation", "rate_limited"].includes(job.status)).length,
     failed: jobs.filter((job) => job.status === "failed").length,
     done: jobs.filter((job) => ["downloaded", "completed"].includes(job.status)).length,
@@ -4718,15 +5022,21 @@ function renderJobs() {
   box.innerHTML = `
     <div class="job-summary">
       <span>任务 ${summary.total}</span>
+      ${summary.submitting ? `<span>提交中 ${summary.submitting}</span>` : ""}
       ${summary.running ? `<span>生成中 ${summary.running}</span>` : ""}
       ${summary.blocked ? `<span class="bad">待处理 ${summary.blocked}</span>` : ""}
       ${summary.failed ? `<span class="bad">失败 ${summary.failed}</span>` : ""}
       ${summary.done ? `<span class="ok">完成 ${summary.done}</span>` : ""}
+      ${queuePaused ? `<span class="bad">提交已暂停</span>` : ""}
+      <button type="button" class="job-summary-action ${queuePaused ? "primary" : ""}" id="toggleQueuePause">${queuePaused ? "恢复提交" : "暂停提交"}</button>
       ${queryableRunning.length ? `<button type="button" class="job-summary-action" id="refreshRunningJobs">刷新全部生成中</button>` : ""}
     </div>
+    ${queuePaused ? `<div class="job-auto-query bad">新任务会继续登记为待提交；已生成中的任务仍会刷新结果。</div>` : ""}
     ${queryStatus ? `<div class="job-auto-query">${escapeHtml(queryStatus)}</div>` : ""}
   ` + jobs.map((job) => {
     const replyNote = jobReplyNote(job);
+    const promptDetailKey = `${job.job_id}:prompt`;
+    const commandDetailKey = `${job.job_id}:command`;
     return `
     <details class="job-card" data-job-detail="${escapeHtml(job.job_id)}" ${state.openJobIds.includes(job.job_id) ? "open" : ""}>
       <summary>
@@ -4762,12 +5072,12 @@ function renderJobs() {
         <div>类型：${job.kind === "image" ? "图片生成" : "视频生成"}</div>
         <div>通用设置：${escapeHtml(commonParameterSummary(job.parameters || {}) || "未设置")}</div>
         <div>${escapeHtml(platformLabel(job.platform))} 专属：${escapeHtml(platformParameterSummary(job.platform, job.parameters || {}) || "无")}</div>
-        <details>
+        <details data-job-subdetail="${escapeHtml(promptDetailKey)}" ${state.openJobSubdetailIds.includes(promptDetailKey) ? "open" : ""}>
           <summary>提交提示词</summary>
           <textarea class="job-command-view" readonly>${escapeHtml(job.submitted_prompt || job.prompt || "")}</textarea>
         </details>
         ${visibleSubmittedCommand(job) ? `
-          <details>
+          <details data-job-subdetail="${escapeHtml(commandDetailKey)}" ${state.openJobSubdetailIds.includes(commandDetailKey) ? "open" : ""}>
             <summary>平台提交内容</summary>
             <textarea class="job-command-view" readonly>${escapeHtml(visibleSubmittedCommand(job))}</textarea>
           </details>
@@ -4786,6 +5096,9 @@ function renderJobs() {
   $("#refreshRunningJobs")?.addEventListener("click", () => {
     refreshRunningJobsNow().catch((error) => setStatus(error.message, "bad"));
   });
+  $("#toggleQueuePause")?.addEventListener("click", () => {
+    toggleQueuePause().catch((error) => setStatus(error.message, "bad"));
+  });
   box.querySelectorAll("[data-confirm-job]").forEach((button) => {
     button.addEventListener("click", () => confirmJob(button.dataset.confirmJob));
   });
@@ -4800,6 +5113,11 @@ function renderJobs() {
       rememberOpenId("openJobIds", detail.dataset.jobDetail, detail.open);
     });
   });
+  box.querySelectorAll("[data-job-subdetail]").forEach((detail) => {
+    detail.addEventListener("toggle", () => {
+      rememberOpenId("openJobSubdetailIds", detail.dataset.jobSubdetail, detail.open);
+    });
+  });
 }
 
 function renderReview() {
@@ -4809,10 +5127,26 @@ function renderReview() {
   const promptRevisions = Array.isArray(state.promptContext?.revisions)
     ? [...state.promptContext.revisions].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
     : [];
-  if (!memoNodes.length && !promptRevisions.length) {
+  const archives = Array.isArray(state.archives)
+    ? [...state.archives].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+    : [];
+  if (!memoNodes.length && !promptRevisions.length && !archives.length) {
     box.innerHTML = `<p class="hint">还没有项目复盘。先添加一个备忘录节点，再把它和相关节点连起来。</p>`;
     return;
   }
+  const archiveHtml = archives.length ? `
+    <details class="review-card" open>
+      <summary>
+        <strong>已归档分镜</strong>
+        <span class="hint">${archives.length} 组</span>
+      </summary>
+      <div class="review-body">
+        <div class="review-prompt-record-list">
+          ${archives.map(renderArchiveReviewCard).join("")}
+        </div>
+      </div>
+    </details>
+  ` : "";
   const promptRevisionHtml = promptRevisions.length ? `
     <details class="review-card" open>
       <summary>
@@ -4865,7 +5199,63 @@ function renderReview() {
       </details>
     `;
   }).join("");
-  box.innerHTML = promptRevisionHtml + memoHtml;
+  box.innerHTML = archiveHtml + promptRevisionHtml + memoHtml;
+  box.querySelectorAll("[data-restore-archive]").forEach((button) => {
+    button.addEventListener("click", () => {
+      restoreArchive(button.dataset.restoreArchive).catch((error) => setStatus(error.message, "bad"));
+    });
+  });
+}
+
+function renderArchiveReviewCard(archive) {
+  const counts = archive.counts || {};
+  const jobs = Array.isArray(archive.jobs) ? archive.jobs : [];
+  const outputs = Array.isArray(archive.assets)
+    ? archive.assets.filter((asset) => asset.source === "generated" || asset.source_job_id)
+    : [];
+  const memos = Array.isArray(archive.nodes) ? archive.nodes.filter((node) => node.type === "memo") : [];
+  return `
+    <article class="review-prompt-card">
+      <div class="review-linked-head">
+        <strong>${escapeHtml(archive.title || "未命名归档")}</strong>
+        <span class="hint">${escapeHtml(formatTimeLabel(archive.created_at))}</span>
+      </div>
+      <div class="review-prompt-meta">
+        <span>分镜 ${escapeHtml((archive.shot_ids || []).join("、") || "无")}</span>
+        <span>节点 ${escapeHtml(String(counts.nodes || 0))}</span>
+        <span>任务 ${escapeHtml(String(counts.jobs || jobs.length || 0))}</span>
+        <span>成品 ${escapeHtml(String(outputs.length))}</span>
+        <button type="button" data-restore-archive="${escapeHtml(archive.archive_id)}">恢复到画布</button>
+      </div>
+      <div class="review-section">
+        <strong>提示词 / 任务</strong>
+        ${jobs.length ? jobs.slice(0, 6).map((job) => `
+          <div class="review-linked-card">
+            <div class="review-linked-head">
+              <span>${escapeHtml(job.shot_ids?.length ? `分镜 ${job.shot_ids.join("、")}` : job.job_id)}</span>
+              <span class="hint">${escapeHtml(platformLabel(job.platform))} · ${job.kind === "image" ? "图片" : "视频"} · ${escapeHtml(statusInfoFromJob(job)?.label || job.status)}</span>
+            </div>
+            <textarea class="review-detail-text" readonly>${escapeHtml(job.submitted_prompt || job.prompt || "")}</textarea>
+          </div>
+        `).join("") : `<div class="hint">没有关联任务。</div>`}
+      </div>
+      <div class="review-section">
+        <strong>备忘录</strong>
+        ${memos.length ? memos.map((memo) => `
+          <div class="review-note">${sanitizeMemoHtml(memo.data?.html || "") || `<span class="hint">空备忘录</span>`}</div>
+        `).join("") : `<div class="hint">没有关联备忘录。</div>`}
+      </div>
+      <div class="review-section">
+        <strong>成品文件</strong>
+        ${outputs.length ? `<div class="review-media-grid">${outputs.slice(0, 8).map((asset) => `
+          <div class="review-media-card">
+            <div class="hint">${escapeHtml(asset.name || asset.asset_id)}</div>
+            ${asset.kind === "video" && asset.url ? `<video src="${escapeHtml(asset.url)}" controls></video>` : asset.kind === "image" && asset.url ? `<img src="${escapeHtml(asset.url)}" alt="${escapeHtml(asset.name || "")}">` : `<div class="hint">${escapeHtml(asset.file_path || "无本地路径")}</div>`}
+          </div>
+        `).join("")}</div>` : `<div class="hint">没有归档成品。</div>`}
+      </div>
+    </article>
+  `;
 }
 
 function promptRevisionFieldLabel(field) {
@@ -4960,6 +5350,7 @@ function renderParams() {
 }
 
 function render() {
+  const scrollSnapshot = panelScrollSnapshot();
   renderRightPanels();
   renderToolbarState();
   renderCanvasOnly();
@@ -4973,6 +5364,7 @@ function render() {
   renderJobs();
   renderReview();
   renderParams();
+  restorePanelScroll(scrollSnapshot);
   scheduleAutoRefresh();
 }
 
@@ -5029,6 +5421,7 @@ async function loadProject(name = state.projectId) {
   state.shots = sanitizeShotsForState(data.shots || []);
   state.tags = rebuildTagsFromShots(data.tags || []);
   state.jobs = data.jobs;
+  state.archives = Array.isArray(data.archives) ? data.archives : [];
   state.assetLibrary = data.asset_library || { global_rules: "", templates: [], image_model: "agent-auto" };
   state.promptContext = normalizePromptContextForState(data.prompt_context || {});
   state.script = normalizeScriptForState(data.script || {});
@@ -5062,15 +5455,18 @@ function upsertJob(job) {
 }
 
 function renderJobStateOnly() {
+  const scrollSnapshot = panelScrollSnapshot();
   renderToolbarState();
   renderShotTable();
   renderJobs();
   renderReview();
+  restorePanelScroll(scrollSnapshot);
 }
 
 async function syncJobsState(silent = false) {
-  if (state.canvasDirty || canvasInteractionBusy() || inspectorRecentlyActive() || isEditingElement(document.activeElement)) return;
+  if (state.canvasDirty || canvasInteractionBusy() || inspectorRecentlyActive() || panelRecentlyActive() || isEditingElement(document.activeElement)) return;
   const data = await api(`/api/jobs/state?project_id=${encodeURIComponent(state.projectId)}`);
+  state.project = data.project || state.project;
   state.jobs = data.jobs || [];
   state.canvas = data.canvas || state.canvas;
   state.assetLibrary = data.asset_library || state.assetLibrary;
@@ -5079,6 +5475,30 @@ async function syncJobsState(silent = false) {
   if (state.bulkSubmit.active) {
     processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
   }
+  scheduleAutoRefresh();
+}
+
+async function toggleQueuePause() {
+  const paused = !state.project?.queue_paused;
+  const result = await api("/api/jobs/queue-pause", {
+    method: "POST",
+    body: JSON.stringify({ project_id: state.projectId, paused }),
+  });
+  state.project = result.project || state.project;
+  state.jobs = result.jobs || state.jobs;
+  state.canvas = result.canvas || state.canvas;
+  state.assetLibrary = result.asset_library || state.assetLibrary;
+  render();
+  setStatus(
+    paused
+      ? "任务队列已暂停：待提交任务不会继续送到平台，生成中的任务仍会刷新结果。"
+      : "任务队列已恢复：会按平台限制继续提交待提交任务。",
+    "ok"
+  );
+  if (!paused && state.bulkSubmit.active) {
+    processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+  }
+  scheduleAutoRefresh();
 }
 
 async function saveCanvas(options = {}) {
@@ -5376,11 +5796,32 @@ async function importRemoteAsset() {
   urlInput.value = "";
   nameInput.value = "";
   await saveCanvas();
-  setStatus(`已导入 URL 素材：${data.asset.name}。已默认标记为资产，可直接去做标签绑定。`, "ok");
+  setStatus(`已导入 URL 素材：${data.asset.name}。图片已保存到项目 input 文件夹，可直接去做标签绑定。`, "ok");
 }
 
 async function submitGeneration(nodeId, button = null) {
   const feedback = $("#submitFeedback");
+  const tagBlockMessage = tagBindingBlockMessage();
+  if (tagBlockMessage) {
+    showTagBindingBlock(tagBlockMessage);
+    if (feedback) {
+      feedback.textContent = tagBlockMessage;
+      feedback.className = "inline-feedback bad";
+    }
+    renderToolbarState();
+    return;
+  }
+  const node = state.canvas.nodes.find((item) => item.id === nodeId);
+  const controlBlockMessage = globalControlBlockMessage(node ? [node] : []);
+  if (controlBlockMessage) {
+    setStatus(controlBlockMessage, "bad");
+    if (feedback) {
+      feedback.textContent = controlBlockMessage;
+      feedback.className = "inline-feedback bad";
+    }
+    renderToolbarState();
+    return;
+  }
   const forceDuplicate = state.pendingForceSubmitNodeId === nodeId;
   const originalText = button?.textContent || (forceDuplicate ? "仍然提交一条" : "提交生成任务");
   if (button) {
@@ -5483,9 +5924,9 @@ function autoQuerySummary() {
   const queryable = runningJobsForAutoRefresh().length;
   const missingHandle = runningJobsMissingPlatformHandle().length;
   const parts = [];
-  if (queryable) parts.push(`自动查询中：${queryable} 个，每 12 秒轮询`);
+  if (queryable) parts.push(`自动查询中：${queryable} 个，每轮全部查询`);
   if (state.autoRefreshingJobId) parts.push(`正在查 ${state.autoRefreshingJobId}`);
-  if (missingHandle) parts.push(`${missingHandle} 个缺少平台会话，无法查询`);
+  if (missingHandle) parts.push(`提交中 ${missingHandle} 个，等待平台返回会话 ID`);
   return parts.join("；");
 }
 
@@ -5494,7 +5935,7 @@ function canvasInteractionBusy() {
 }
 
 function scheduleAutoRefresh() {
-  if (state.canvasDirty || canvasInteractionBusy() || inspectorRecentlyActive()) {
+  if (state.canvasDirty || canvasInteractionBusy() || inspectorRecentlyActive() || panelRecentlyActive()) {
     if (!state.autoRefreshTimer && !state.syncJobsTimer) {
       state.syncJobsTimer = setTimeout(() => {
         state.syncJobsTimer = null;
@@ -5503,45 +5944,50 @@ function scheduleAutoRefresh() {
     }
     return;
   }
-  if (state.autoRefreshTimer) {
-    clearTimeout(state.autoRefreshTimer);
-    state.autoRefreshTimer = null;
-  }
-  if (state.syncJobsTimer) {
-    clearTimeout(state.syncJobsTimer);
-    state.syncJobsTimer = null;
-  }
   if (state.autoRefreshingJobId) return;
-  if (runningJobsForAutoRefresh().length) {
-    state.autoRefreshTimer = setTimeout(() => {
-      autoRefreshRunningJobs().catch((error) => {
-        console.error(error);
-      });
-    }, 12000);
-    return;
-  }
-  if (runningJobsWaitingForThread().length) {
+  const queryableJobs = runningJobsForAutoRefresh();
+  const waitingForThreadJobs = runningJobsWaitingForThread();
+  if (waitingForThreadJobs.length && !state.syncJobsTimer) {
     state.syncJobsTimer = setTimeout(() => {
+      state.syncJobsTimer = null;
       syncJobsState(true).catch((error) => {
         console.error(error);
       });
     }, 1500);
   }
+  if (!queryableJobs.length && state.autoRefreshTimer) {
+    clearTimeout(state.autoRefreshTimer);
+    state.autoRefreshTimer = null;
+  }
+  if (queryableJobs.length && !state.autoRefreshTimer) {
+    state.autoRefreshTimer = setTimeout(() => {
+      state.autoRefreshTimer = null;
+      autoRefreshRunningJobs().catch((error) => {
+        console.error(error);
+      });
+    }, 12000);
+  }
 }
 
 async function autoRefreshRunningJobs() {
   if (state.autoRefreshingJobId) return;
-  if (canvasInteractionBusy() || inspectorRecentlyActive()) {
+  if (canvasInteractionBusy() || inspectorRecentlyActive() || panelRecentlyActive()) {
     scheduleAutoRefresh();
     return;
   }
-  const job = runningJobsForAutoRefresh()
+  const jobs = runningJobsForAutoRefresh()
     .slice()
-    .sort((a, b) => String(a.updated_at || a.created_at || "").localeCompare(String(b.updated_at || b.created_at || "")))[0];
-  if (!job) return;
-  state.autoRefreshingJobId = job.job_id;
+    .sort((a, b) => String(a.updated_at || a.created_at || "").localeCompare(String(b.updated_at || b.created_at || "")));
+  if (!jobs.length) {
+    scheduleAutoRefresh();
+    return;
+  }
   try {
-    await refreshJob(job.job_id, { silent: true, source: "auto" });
+    for (const job of jobs) {
+      if (!runningJobsForAutoRefresh().some((item) => item.job_id === job.job_id)) continue;
+      state.autoRefreshingJobId = job.job_id;
+      await refreshJob(job.job_id, { silent: true, source: "auto" });
+    }
   } finally {
     state.autoRefreshingJobId = null;
     scheduleAutoRefresh();
@@ -5552,7 +5998,11 @@ async function refreshRunningJobsNow() {
   const jobs = runningJobsForAutoRefresh().slice();
   if (!jobs.length) {
     const missing = runningJobsMissingPlatformHandle().length;
-    setStatus(missing ? `${missing} 个生成中任务缺少平台会话 ID，无法查询，建议重新提交。` : "当前没有可查询的生成中任务。", missing ? "bad" : "");
+    setStatus(missing ? `${missing} 个任务正在等待 Lovart 返回会话 ID，系统会自动同步本地状态。` : "当前没有可查询的生成中任务。", missing ? "ok" : "");
+    if (missing) {
+      await syncJobsState(true);
+      scheduleAutoRefresh();
+    }
     return;
   }
   setStatus(`正在查询 ${jobs.length} 个生成中任务...`);
@@ -5732,6 +6182,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindRightPanelResize();
   setPreferredSeedancePlatform(getPreferredSeedancePlatform());
   applyLeftSectionState();
+  document.querySelectorAll(".panel.left, .panel.right").forEach((panel) => {
+    panel.addEventListener("pointerdown", markPanelInteraction, { capture: true });
+    panel.addEventListener("focusin", markPanelInteraction, { capture: true });
+    panel.addEventListener("input", markPanelInteraction, { capture: true });
+  });
   window.addEventListener("resize", () => {
     renderCanvasOnly();
   });
@@ -5756,6 +6211,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#saveProjectRoot").addEventListener("click", saveProjectRoot);
   $("#saveCanvas").addEventListener("click", () => {
     saveCanvas().catch((error) => setStatus(error.message, "bad"));
+  });
+  $("#archiveSelected")?.addEventListener("click", () => {
+    archiveSelectedNodes().catch((error) => setStatus(error.message, "bad"));
   });
   $("#restoreCanvasDraft")?.addEventListener("click", () => {
     restoreCanvasDraft().catch((error) => setStatus(`恢复本地备份失败：${error.message}`, "bad"));
@@ -5929,6 +6387,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#applyPromptVideo").addEventListener("click", () => applyPromptOptimization(["video"]));
   $("#applyPromptBoth").addEventListener("click", () => applyPromptOptimization(["image", "video"]));
   $("#projectCreateConfirm").addEventListener("click", createProjectFromPicker);
+  $("#exportReusePackage")?.addEventListener("click", () => {
+    exportReusePackage().catch((error) => setStatus(`导出复用包失败：${error.message}`, "bad"));
+  });
+  $("#reusePackageFile")?.addEventListener("change", async (event) => {
+    const file = event.target.files?.[0];
+    if (file) await importReusePackageFile(file);
+    event.target.value = "";
+  });
   $("#capturePreviewFrame").addEventListener("click", () => {
     if (!state.previewVideoNodeId) return setStatus("先打开一个视频预览。", "bad");
     captureVideoFrame(state.previewVideoNodeId, true);

@@ -18,7 +18,20 @@ const DEFAULT_PYTHON = process.platform === "win32" ? "python" : "python3";
 const ENABLED_PLATFORMS = new Set(["lovart", "jimeng_cli"]);
 const PYTHON = process.env.PYTHON || DEFAULT_PYTHON;
 const DREAMINA = process.env.DREAMINA || "dreamina";
+const DREAMINA_SUBMIT_TIMEOUT_MS = 180000;
+const DREAMINA_QUERY_TIMEOUT_MS = 120000;
+const DIRECT_NETWORK_ENV = {
+  HTTP_PROXY: "",
+  HTTPS_PROXY: "",
+  ALL_PROXY: "",
+  http_proxy: "",
+  https_proxy: "",
+  all_proxy: "",
+  NO_PROXY: "*",
+  no_proxy: "*",
+};
 const lovartProjectLocks = new Map();
+const activeJobSubmissions = new Set();
 const HOMEBREW_FFMPEG = "/opt/homebrew/bin/ffmpeg";
 const HOMEBREW_FFPROBE = "/opt/homebrew/bin/ffprobe";
 const FFMPEG = process.env.FFMPEG || (fs.existsSync(HOMEBREW_FFMPEG) ? HOMEBREW_FFMPEG : "ffmpeg");
@@ -252,6 +265,7 @@ function loadProject(projectId) {
     shots: readJson(path.join(dir, "shots.json"), []),
     tags: readJson(path.join(dir, "tags.json"), []),
     jobs: readJson(path.join(dir, "jobs.json"), []),
+    archives: readJson(path.join(dir, "archives.json"), []),
     prompt_context: loadPromptContext(projectId),
     script: loadScript(projectId),
     asset_library: readJson(path.join(dir, "asset_library.json"), { global_rules: "", templates: [], image_model: "agent-auto" }),
@@ -312,6 +326,14 @@ function saveProjectMeta(projectId, patch) {
   return next;
 }
 
+function setQueuePaused(projectId, paused) {
+  const isPaused = Boolean(paused);
+  return saveProjectMeta(projectId, {
+    queue_paused: isPaused,
+    queue_paused_at: isPaused ? now() : "",
+  });
+}
+
 function parseLovartMetaFromLog(projectId, jobId) {
   const file = path.join(projectDir(projectId), "logs", `${jobId}.log`);
   if (!fs.existsSync(file)) return {};
@@ -364,6 +386,7 @@ function migrateLovartMeta(projectId, data) {
       job.status === "running"
       && !job.lovart_thread_id
       && !job.jimeng_submit_id
+      && !activeJobSubmissions.has(job.job_id)
       && Date.now() - new Date(job.updated_at || job.created_at || 0).getTime() > 10 * 60 * 1000
     ) {
       job.status = "failed";
@@ -595,6 +618,7 @@ function createProject(name) {
   if (!fs.existsSync(path.join(dir, "shots.json"))) writeJson(path.join(dir, "shots.json"), []);
   if (!fs.existsSync(path.join(dir, "tags.json"))) writeJson(path.join(dir, "tags.json"), []);
   if (!fs.existsSync(path.join(dir, "jobs.json"))) writeJson(path.join(dir, "jobs.json"), []);
+  if (!fs.existsSync(path.join(dir, "archives.json"))) writeJson(path.join(dir, "archives.json"), []);
   if (!fs.existsSync(path.join(dir, "prompt_context.json"))) writeJson(path.join(dir, "prompt_context.json"), defaultPromptContext());
   if (!fs.existsSync(path.join(dir, "script.json"))) writeJson(path.join(dir, "script.json"), defaultScript());
   if (!fs.existsSync(path.join(dir, "asset_library.json"))) writeJson(path.join(dir, "asset_library.json"), defaultAssetLibrary());
@@ -621,6 +645,152 @@ function listProjects() {
     .filter(Boolean)
     .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
   return { project_root: root, projects: entries };
+}
+
+function uniqueProjectId(baseName) {
+  const root = loadSettings().project_root;
+  ensureDir(root);
+  const base = safeName(baseName || "复用项目");
+  let candidate = base;
+  let count = 2;
+  while (fs.existsSync(path.join(root, candidate, "project.json"))) {
+    candidate = `${base}_${count}`;
+    count += 1;
+  }
+  return candidate;
+}
+
+function resolveProjectFile(projectId, filePath = "") {
+  if (!filePath) return "";
+  const root = path.resolve(projectDir(projectId));
+  const abs = path.resolve(path.isAbsolute(filePath) ? filePath : path.join(root, filePath));
+  if (!abs.startsWith(root) || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) return "";
+  return abs;
+}
+
+function assetPortableFile(projectId, asset = {}) {
+  return resolveProjectFile(projectId, asset.file_path)
+    || resolveProjectFile(projectId, asset.thumbnail_path);
+}
+
+function exportProjectReusePackage(projectId) {
+  const data = loadProject(projectId);
+  const boundAssetIds = new Set((data.tags || []).flatMap((tag) => tag.bound_asset_ids || []));
+  const reusableAssets = (data.canvas.assets || []).filter((asset) => (
+    boundAssetIds.has(asset.asset_id)
+    || asset.is_library_asset
+    || ["character", "scene", "prop"].includes(String(asset.asset_category || ""))
+  ));
+  const reusableAssetIds = new Set(reusableAssets.map((asset) => asset.asset_id).filter(Boolean));
+  const tags = (data.tags || []).map((tag) => ({
+    ...tag,
+    bound_asset_ids: (tag.bound_asset_ids || []).filter((assetId) => reusableAssetIds.has(assetId)),
+  }));
+  const files = [];
+  const missing_files = [];
+  const assets = reusableAssets.map((asset) => {
+    const file = assetPortableFile(projectId, asset);
+    const fileName = file ? path.basename(file) : "";
+    if (file) {
+      files.push({
+        asset_id: asset.asset_id,
+        file_name: fileName,
+        kind: asset.kind || assetKindFromFile(file),
+        mime: MIME[path.extname(file).toLowerCase()] || "application/octet-stream",
+        base64: fs.readFileSync(file).toString("base64"),
+      });
+    } else {
+      missing_files.push(asset.name || asset.asset_id);
+    }
+    const { url, file_path, thumbnail_path, ...rest } = asset;
+    return {
+      ...rest,
+      package_file_name: fileName,
+      original_file_name: fileName,
+    };
+  });
+  const global_controls = (data.canvas.nodes || [])
+    .filter((node) => node.type === "globalControl")
+    .map((node) => ({
+      type: "globalControl",
+      data: {
+        title: node.data?.title || "全局控制",
+        text: node.data?.text || "",
+      },
+    }));
+  return {
+    package_type: "ai_video_reuse_pack",
+    version: 1,
+    exported_at: now(),
+    source_project: {
+      project_id: data.project?.project_id || projectId,
+      name: data.project?.name || projectId,
+    },
+    tags,
+    assets,
+    files,
+    global_controls,
+    asset_library: data.asset_library || defaultAssetLibrary(),
+    missing_files,
+  };
+}
+
+function importProjectReusePackage(pack = {}, projectName = "") {
+  if (pack.package_type !== "ai_video_reuse_pack") {
+    throw new Error("这不是 AI 视频项目复用包。");
+  }
+  const baseName = projectName || `${pack.source_project?.name || "复用项目"}_复用`;
+  const projectId = uniqueProjectId(baseName);
+  createProject(projectId);
+  const dir = projectDir(projectId);
+  const inputDir = path.join(dir, "input");
+  ensureDir(inputDir);
+  const fileByAssetId = new Map((pack.files || []).map((file) => [file.asset_id, file]));
+  const assets = (pack.assets || []).map((asset) => {
+    const file = fileByAssetId.get(asset.asset_id);
+    let filePath = "";
+    if (file?.base64) {
+      const safeFileName = safeName(file.file_name || asset.package_file_name || asset.name || asset.asset_id);
+      const ext = path.extname(file.file_name || asset.package_file_name || "") || extensionFromMime(file.mime || "", ".bin");
+      const base = path.extname(safeFileName) ? safeFileName : `${safeFileName}${ext}`;
+      filePath = uniquePath(inputDir, base);
+      fs.writeFileSync(filePath, Buffer.from(file.base64, "base64"));
+    }
+    const { package_file_name, original_file_name, ...rest } = asset;
+    return {
+      ...rest,
+      source: rest.source || "input",
+      file_path: filePath || undefined,
+      thumbnail_path: filePath && (rest.kind || file?.kind) === "image" ? filePath : undefined,
+      url: filePath ? publicAssetUrl(projectId, filePath) : rest.external_url || "",
+    };
+  });
+  const canvas = {
+    nodes: (pack.global_controls || []).map((node, index) => ({
+      id: id("node"),
+      type: "globalControl",
+      x: 80,
+      y: 80 + index * 150,
+      data: {
+        title: node.data?.title || "全局控制",
+        text: node.data?.text || "",
+      },
+    })),
+    edges: [],
+    assets,
+  };
+  const assetIds = new Set(assets.map((asset) => asset.asset_id).filter(Boolean));
+  const tags = (pack.tags || []).map((tag) => ({
+    ...tag,
+    bound_asset_ids: (tag.bound_asset_ids || []).filter((assetId) => assetIds.has(assetId)),
+  }));
+  saveProjectPart(projectId, "canvas.json", canvas);
+  saveProjectPart(projectId, "tags.json", tags);
+  saveProjectPart(projectId, "jobs.json", []);
+  saveProjectPart(projectId, "shots.json", []);
+  saveProjectPart(projectId, "archives.json", []);
+  saveProjectPart(projectId, "asset_library.json", pack.asset_library || defaultAssetLibrary());
+  return loadProject(projectId);
 }
 
 function parseShots(text) {
@@ -1051,15 +1221,35 @@ async function ensureJimengLocalAsset(projectId, asset, hint = {}) {
     if (!asset.thumbnail_path && asset.kind === "image") asset.thumbnail_path = existingFile;
     return existingFile;
   }
-  const fileUrl = remoteAssetUrl(asset);
-  if (!fileUrl) return "";
-  const cacheDir = path.join(projectDir(projectId), "input");
-  ensureDir(cacheDir);
-  const baseName = safeName(asset.name || asset.asset_id || "remote_asset");
-  const { filePath } = await downloadRemoteFile(fileUrl, path.join(cacheDir, baseName));
-  asset.file_path = filePath;
-  if (!asset.thumbnail_path && asset.kind === "image") asset.thumbnail_path = filePath;
-  return filePath;
+  return "";
+}
+
+async function stageJimengUploadFile(projectId, job, sourcePath, index, kind, logFile) {
+  if (!sourcePath || !fs.existsSync(sourcePath)) return "";
+  const projectKey = crypto
+    .createHash("sha1")
+    .update(String(projectId || "project"))
+    .digest("hex")
+    .slice(0, 12);
+  const jobKey = String(job?.job_id || job?.id || "job").replace(/[^a-zA-Z0-9_-]/g, "_");
+  const ext = path.extname(sourcePath).toLowerCase() || ".bin";
+  const safeKind = String(kind || "asset").replace(/[^a-zA-Z0-9_-]/g, "_") || "asset";
+  const destDir = path.join(os.tmpdir(), "ai-video-jimeng-uploads", projectKey, jobKey);
+  ensureDir(destDir);
+  const shouldOptimizeImage = safeKind === "image" && /\.(png|jpe?g|webp)$/i.test(ext);
+  const destPath = path.join(destDir, `${safeKind}_${String(index + 1).padStart(2, "0")}${shouldOptimizeImage ? ".jpg" : ext}`);
+  if (shouldOptimizeImage) {
+    const result = await runCommand("/usr/bin/sips", [
+      "-s", "format", "jpeg",
+      "-s", "formatOptions", "86",
+      "-Z", "2048",
+      sourcePath,
+      "--out", destPath,
+    ], logFile, {}, { timeoutMs: 30000 });
+    if (result.ok && fs.existsSync(destPath)) return destPath;
+  }
+  fs.copyFileSync(sourcePath, destPath);
+  return destPath;
 }
 
 async function ensureLocalAssetFile(projectId, asset) {
@@ -1380,7 +1570,7 @@ function collectInputs(canvas, nodeIds) {
   for (const edge of incoming) {
     const source = byId.get(edge.source);
     if (!source) continue;
-    if (source.type === "text") promptParts.push(source.data?.text || "");
+    if (["globalControl", "text"].includes(source.type)) promptParts.push(source.data?.text || "");
     if (source.data?.asset_id && !seenAssetIds.has(source.data.asset_id)) {
       seenAssetIds.add(source.data.asset_id);
       assetInputs.push({
@@ -1425,24 +1615,21 @@ function referenceRoleLabel(role) {
 }
 
 function buildNumberedReferenceLabels(inputAssets = []) {
-  const counters = {};
+  const mediaCounters = { image: 0, video: 0, audio: 0, file: 0 };
   return inputAssets.map((item, index) => {
-    const role = item.reference_role || "reference";
-    counters[role] = (counters[role] || 0) + 1;
-    const identity = item.primary_tag_label || item.asset_name;
+    const kind = item.asset?.kind || item.asset_kind || "image";
+    const mediaKey = kind === "video" ? "video" : kind === "audio" ? "audio" : kind === "image" ? "image" : "file";
+    mediaCounters[mediaKey] += 1;
+    const mediaLabel = mediaKey === "image"
+      ? `图片${mediaCounters[mediaKey]}`
+      : mediaKey === "video"
+        ? `视频${mediaCounters[mediaKey]}`
+        : mediaKey === "audio"
+          ? `音频${mediaCounters[mediaKey]}`
+          : `文件${mediaCounters[mediaKey]}`;
+    const identity = item.primary_tag_label || item.asset_name || mediaLabel;
     const alias = item.asset_name && item.asset_name !== identity ? ` / ${item.asset_name}` : "";
-    const roleText = role === "character_reference"
-      ? `角色${counters[role]}参考`
-      : role === "scene_reference"
-        ? `场景${counters[role]}参考`
-        : role === "prop_reference"
-          ? `道具${counters[role]}参考`
-          : role === "motion_reference"
-            ? `运动参考${counters[role]}`
-            : role === "reference"
-              ? `普通参考${counters[role]}`
-              : referenceRoleLabel(role);
-    return `附件${index + 1}（${identity}${alias}）= ${roleText}`;
+    return `附件${index + 1} / ${mediaLabel} = ${identity}${alias}（${referenceRoleLabel(item.reference_role || "reference")}）`;
   });
 }
 
@@ -1521,13 +1708,13 @@ function buildReferencePromptText(kind, inputAssets = [], parameters = {}) {
   const standardTags = Array.from(new Set(inputAssets.flatMap((item) => item.tag_labels || []).filter(Boolean)));
   const attachmentLines = buildNumberedReferenceLabels(inputAssets);
   const guidance = kind === "image"
-    ? "请按上面的附件身份使用参考图，不要忽略附件，也不要混淆角色、场景和道具。"
+    ? "请按上面的附件编号和图片编号使用参考图，不要忽略附件，也不要混淆角色、场景和道具。"
     : [
         parameters.feature === "first_frame" || inputAssets.some((item) => item.reference_role === "first_frame")
           ? "请严格使用被标记为“首帧参考”的附件作为起始画面。"
           : "",
         "角色参考只用于角色一致性，场景参考只用于空间与布光，道具参考只用于物体细节。",
-        "不要混淆各附件用途；若模型无法遵守，请直接说明具体原因。",
+        "不要混淆各附件编号、图片编号和用途；若模型无法遵守，请直接说明具体原因。",
       ].filter(Boolean).join(" ");
   return [
     standardTags.length ? `本任务标准标签名：${standardTags.join("、")}。请优先按这些标签名理解角色、场景和道具。` : "",
@@ -1793,6 +1980,20 @@ function htmlToPlainText(html) {
     .trim());
 }
 
+function htmlCellTextByClass(rowHtml, className) {
+  const pattern = new RegExp(`<td\\b[^>]*class=["'][^"']*\\b${className}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/td>`, "i");
+  return htmlToPlainText(String(rowHtml || "").match(pattern)?.[1] || "");
+}
+
+function transitionFromImportedLabel(value) {
+  const text = String(value || "").trim().replace(/\s+/g, "");
+  if (!text) return "video_direct";
+  if (/接上一尾帧|接上一帧|上一尾帧|continue_prev_tail|prev_tail|tail/i.test(text)) return "continue_prev_tail";
+  if (/新建首帧|新首帧|首帧|new_frame|first_frame/i.test(text)) return "new_frame";
+  if (/视频直出|直出|video_direct|direct/i.test(text)) return "video_direct";
+  return "video_direct";
+}
+
 function parseShotlistHtml(html, preferredSeedancePlatform = "lovart") {
   const source = String(html || "").replace(/\r\n/g, "\n");
   const episode = source.match(/Episode\s*(\d+)/i)?.[1] || "1";
@@ -1813,6 +2014,7 @@ function parseShotlistHtml(html, preferredSeedancePlatform = "lovart") {
     rowPromptRegex.lastIndex = 0;
     while ((match = rowPromptRegex.exec(block.body))) {
       const scene = String(match[2] || block.scene || "").trim();
+      const rowHtml = match[3] || "";
       const promptCell = match[4] || "";
       const headMatch = promptCell.match(/<div\b[^>]*class=["'][^"']*\bprompt-head\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
       const promptBlockMatch = promptCell.match(/<div\b[^>]*class=["'][^"']*\bprompt-block\b[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
@@ -1821,12 +2023,14 @@ function parseShotlistHtml(html, preferredSeedancePlatform = "lovart") {
       const promptNumber = headText.match(/提示词\s*(\d+)/)?.[1] || String(shots.length + 1);
       const video_prompt = htmlToPlainText(promptBlockMatch[1]);
       if (!video_prompt) continue;
+      const video_model = htmlCellTextByClass(rowHtml, "c-model");
+      const transition = transitionFromImportedLabel(htmlCellTextByClass(rowHtml, "c-link"));
       shots.push(normalizeShot({
         shot_id: `分镜${episode}-${scene}-${promptNumber}`,
-        transition: "video_direct",
+        transition,
         image_prompt: "",
         video_prompt,
-        video_model: "seedance2.0fast",
+        video_model,
         duration: extractDurationFromPrompt(video_prompt),
         size: extractAspectRatioFromPrompt(video_prompt),
         tag_refs: extractTags(video_prompt),
@@ -2057,12 +2261,12 @@ async function runJimengJob(projectId, job, canvas) {
     if (videoInputs.length || audioInputs.length) {
       return { ok: false, reason: "即梦图生图当前只支持图片，先把视频和音频断开。" };
     }
-    for (const item of imageInputs) {
+    for (const [index, item] of imageInputs.entries()) {
       const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
-        return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
+        return { ok: false, reason: `素材“${item.asset.name}”只有远程 URL，没有本地文件。即梦提交必须使用本地素材，请先重新导入这个资产或换成本地图片。` };
       }
-      args.push("--images", localPath);
+      args.push("--images", await stageJimengUploadFile(projectId, job, localPath, index, "image", logFile));
     }
     const ratio = String(job.parameters?.size || "").trim();
     if (ratio) args.push("--ratio", ratio);
@@ -2089,9 +2293,9 @@ async function runJimengJob(projectId, job, canvas) {
     const imageAsset = imageInput?.asset || firstJimengImageInput(job, canvas);
     const localImagePath = await ensureJimengLocalAsset(projectId, imageAsset, imageInput || {});
     if (!localImagePath || !fs.existsSync(localImagePath)) {
-      return { ok: false, reason: "这张图片还没法给即梦使用。先检查 URL 是否还能访问，或改用本地图片。" };
+      return { ok: false, reason: "这张图片只有远程 URL，没有本地文件。即梦提交必须使用本地素材，请先重新导入这个资产或换成本地图片。" };
     }
-    args.push("--image", localImagePath);
+    args.push("--image", await stageJimengUploadFile(projectId, job, localImagePath, 0, "image", logFile));
   } else if (mode === "multimodal2video") {
     if (!imageInputs.length && !videoInputs.length) {
       return { ok: false, reason: "即梦全能参考至少要连一张图片或一个视频。" };
@@ -2105,26 +2309,26 @@ async function runJimengJob(projectId, job, canvas) {
     if (audioInputs.length > 3) {
       return { ok: false, reason: "即梦全能参考当前最多支持 3 个音频参考，请先减少一些。" };
     }
-    for (const item of imageInputs) {
+    for (const [index, item] of imageInputs.entries()) {
       const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
-        return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
+        return { ok: false, reason: `素材“${item.asset.name}”只有远程 URL，没有本地文件。即梦提交必须使用本地素材，请先重新导入这个资产或换成本地图片。` };
       }
-      args.push("--image", localPath);
+      args.push("--image", await stageJimengUploadFile(projectId, job, localPath, index, "image", logFile));
     }
-    for (const item of videoInputs) {
+    for (const [index, item] of videoInputs.entries()) {
       const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
-        return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
+        return { ok: false, reason: `素材“${item.asset.name}”只有远程 URL，没有本地文件。即梦提交必须使用本地素材，请先重新导入这个资产或换成本地视频。` };
       }
-      args.push("--video", localPath);
+      args.push("--video", await stageJimengUploadFile(projectId, job, localPath, index, "video", logFile));
     }
-    for (const item of audioInputs) {
+    for (const [index, item] of audioInputs.entries()) {
       const localPath = await ensureJimengLocalAsset(projectId, item.asset, item);
       if (!localPath || !fs.existsSync(localPath)) {
-        return { ok: false, reason: `素材“${item.asset.name}”还没法给即梦使用。先检查这个 URL 是否还能访问，或改用本地文件。` };
+        return { ok: false, reason: `素材“${item.asset.name}”只有远程 URL，没有本地文件。即梦提交必须使用本地素材，请先重新导入这个资产或换成本地音频。` };
       }
-      args.push("--audio", localPath);
+      args.push("--audio", await stageJimengUploadFile(projectId, job, localPath, index, "audio", logFile));
     }
     const ratio = String(job.parameters?.size || "").trim();
     if (ratio) args.push("--ratio", ratio);
@@ -2134,7 +2338,7 @@ async function runJimengJob(projectId, job, canvas) {
 
   job.submitted_prompt = prompt;
   job.submitted_command = `${DREAMINA} ${args.join(" ")}`;
-  const result = await runCommand(DREAMINA, args, logFile, {}, { timeoutMs: 15000 });
+  const result = await runCommand(DREAMINA, args, logFile, DIRECT_NETWORK_ENV, { timeoutMs: DREAMINA_SUBMIT_TIMEOUT_MS });
   if (!result.ok) {
     return { ok: false, reason: result.error || "即梦 CLI 调用失败" };
   }
@@ -2212,7 +2416,7 @@ async function refreshDreaminaJob(projectId, job) {
     job.jimeng_submit_id,
     "--download_dir",
     outputDir,
-  ], logFile, {}, { timeoutMs: 15000 });
+  ], logFile, DIRECT_NETWORK_ENV, { timeoutMs: DREAMINA_QUERY_TIMEOUT_MS });
   if (!result.ok) {
     return { ok: false, reason: result.error || "即梦结果刷新失败" };
   }
@@ -2648,10 +2852,227 @@ function saveBackgroundErrorLog(projectId, jobId, error) {
   } catch {}
 }
 
+function nodeShotIds(node = {}) {
+  return Array.from(new Set([
+    node.data?.shot_id,
+    ...(Array.isArray(node.data?.shot_ids) ? node.data.shot_ids : []),
+  ].map((item) => String(item || "").trim()).filter(Boolean)));
+}
+
+function jobShotIds(job = {}) {
+  return Array.from(new Set((job.shot_ids || []).map((item) => String(item || "").trim()).filter(Boolean)));
+}
+
+function intersectsSet(values = [], set = new Set()) {
+  return values.some((value) => set.has(value));
+}
+
+function archiveTitle(shotIds = [], nodes = []) {
+  if (shotIds.length) {
+    const first = shotIds.slice(0, 3).join("、");
+    return shotIds.length > 3 ? `分镜 ${first} 等 ${shotIds.length} 个` : `分镜 ${first}`;
+  }
+  const firstNode = nodes[0];
+  return firstNode ? `节点 ${firstNode.data?.title || firstNode.id}` : "未命名归档";
+}
+
+function archiveSelectedNodes(projectId, nodeIds = []) {
+  const data = loadProject(projectId);
+  const selectedIds = new Set((nodeIds || []).map(String).filter(Boolean));
+  const selectedNodes = data.canvas.nodes.filter((node) => selectedIds.has(node.id));
+  if (!selectedNodes.length) throw new Error("先选中要归档的分镜节点。");
+
+  const shotIds = new Set(selectedNodes.flatMap(nodeShotIds));
+  const archiveNodeIds = new Set(selectedNodes.map((node) => node.id));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of data.canvas.nodes || []) {
+      const shots = nodeShotIds(node);
+      if (shots.length && intersectsSet(shots, shotIds) && !archiveNodeIds.has(node.id)) {
+        archiveNodeIds.add(node.id);
+        changed = true;
+      }
+    }
+    for (const edge of data.canvas.edges || []) {
+      const sourceArchived = archiveNodeIds.has(edge.source);
+      const targetArchived = archiveNodeIds.has(edge.target);
+      if (sourceArchived === targetArchived) continue;
+      const source = data.canvas.nodes.find((node) => node.id === edge.source);
+      const target = data.canvas.nodes.find((node) => node.id === edge.target);
+      const other = sourceArchived ? target : source;
+      if (other?.type === "memo" || other?.type === "globalControl") {
+        archiveNodeIds.add(other.id);
+        changed = true;
+      }
+    }
+  }
+
+  const relatedJobs = (data.jobs || []).filter((job) => (
+    archiveNodeIds.has(job.target_node_id)
+    || intersectsSet(jobShotIds(job), shotIds)
+  ));
+  const activeStatuses = new Set(["queued", "running", "rate_limited", "pending_confirmation", "needs_input"]);
+  const activeJob = relatedJobs.find((job) => activeStatuses.has(job.status));
+  if (activeJob) {
+    const shotText = jobShotIds(activeJob).join("、") || activeJob.job_id;
+    throw new Error(`分镜 ${shotText} 还有未结束任务，先等它完成或处理失败后再归档。`);
+  }
+
+  const outputAssetIds = new Set(relatedJobs.flatMap((job) => job.output_asset_ids || []));
+  for (const node of data.canvas.nodes || []) {
+    if (node.data?.asset_id && outputAssetIds.has(node.data.asset_id)) archiveNodeIds.add(node.id);
+  }
+
+  const archivedNodes = (data.canvas.nodes || []).filter((node) => archiveNodeIds.has(node.id));
+  const archivedEdges = (data.canvas.edges || []).filter((edge) => archiveNodeIds.has(edge.source) && archiveNodeIds.has(edge.target));
+  const nodeAssetIds = new Set(archivedNodes.map((node) => node.data?.asset_id).filter(Boolean));
+  const jobAssetIds = new Set(relatedJobs.flatMap((job) => [
+    ...(job.input_asset_ids || []),
+    ...(job.output_asset_ids || []),
+  ]));
+  const archiveAssetIds = new Set([...nodeAssetIds, ...jobAssetIds]);
+  const archivedAssets = (data.canvas.assets || []).filter((asset) => archiveAssetIds.has(asset.asset_id));
+  const archivedShotIds = Array.from(shotIds);
+  const archivedShots = (data.shots || []).filter((shot) => shotIds.has(String(shot.shot_id || "")));
+  const archivedRevisions = (data.prompt_context?.revisions || []).filter((revision) => (
+    shotIds.has(String(revision.shot_id || ""))
+    || archiveNodeIds.has(String(revision.node_id || ""))
+  ));
+  const archivedBindings = (data.script?.bindings || []).filter((binding) => shotIds.has(String(binding.shot_id || "")));
+  const segmentIds = new Set(archivedBindings.map((binding) => binding.segment_id).filter(Boolean));
+  const archivedSegments = (data.script?.segments || []).filter((segment) => segmentIds.has(segment.segment_id));
+  const archivedTags = (data.tags || []).filter((tag) => intersectsSet(tag.referenced_by_shot_ids || [], shotIds));
+  const archive = {
+    archive_id: id("archive"),
+    title: archiveTitle(archivedShotIds, archivedNodes),
+    created_at: now(),
+    shot_ids: archivedShotIds,
+    nodes: archivedNodes,
+    edges: archivedEdges,
+    assets: archivedAssets,
+    jobs: relatedJobs,
+    shots: archivedShots,
+    tags: archivedTags,
+    prompt_revisions: archivedRevisions,
+    script_bindings: archivedBindings,
+    script_segments: archivedSegments,
+    counts: {
+      nodes: archivedNodes.length,
+      jobs: relatedJobs.length,
+      assets: archivedAssets.length,
+      memos: archivedNodes.filter((node) => node.type === "memo").length,
+      shots: archivedShots.length,
+    },
+  };
+
+  data.canvas.nodes = (data.canvas.nodes || []).filter((node) => !archiveNodeIds.has(node.id));
+  data.canvas.edges = (data.canvas.edges || []).filter((edge) => !archiveNodeIds.has(edge.source) && !archiveNodeIds.has(edge.target));
+  const remainingNodeAssetIds = new Set(data.canvas.nodes.map((node) => node.data?.asset_id).filter(Boolean));
+  const removableAssetIds = new Set(archivedAssets
+    .filter((asset) => (asset.source === "generated" || asset.source_job_id) && !remainingNodeAssetIds.has(asset.asset_id))
+    .map((asset) => asset.asset_id));
+  data.canvas.assets = (data.canvas.assets || []).filter((asset) => !removableAssetIds.has(asset.asset_id));
+  const relatedJobIds = new Set(relatedJobs.map((job) => job.job_id));
+  data.jobs = (data.jobs || []).filter((job) => !relatedJobIds.has(job.job_id));
+  data.shots = (data.shots || []).filter((shot) => !shotIds.has(String(shot.shot_id || "")));
+  data.tags = buildTags(data.shots, data.tags);
+  data.prompt_context.revisions = (data.prompt_context.revisions || []).filter((revision) => !archivedRevisions.some((item) => item.revision_id === revision.revision_id));
+  data.script.bindings = (data.script.bindings || []).filter((binding) => !shotIds.has(String(binding.shot_id || "")));
+  data.archives = [archive, ...(data.archives || [])];
+
+  saveProjectPart(projectId, "canvas.json", data.canvas);
+  saveProjectPart(projectId, "jobs.json", data.jobs);
+  saveProjectPart(projectId, "shots.json", data.shots);
+  saveProjectPart(projectId, "tags.json", data.tags);
+  saveProjectPart(projectId, "prompt_context.json", data.prompt_context);
+  saveProjectPart(projectId, "script.json", data.script);
+  saveProjectPart(projectId, "archives.json", data.archives);
+  return { data, archive };
+}
+
+function restoreArchive(projectId, archiveId = "") {
+  const data = loadProject(projectId);
+  const archive = (data.archives || []).find((item) => item.archive_id === archiveId);
+  if (!archive) throw new Error("找不到这个归档。");
+  const assetIds = new Set((data.canvas.assets || []).map((asset) => asset.asset_id));
+  for (const asset of archive.assets || []) {
+    if (asset.asset_id && !assetIds.has(asset.asset_id)) {
+      data.canvas.assets.push(asset);
+      assetIds.add(asset.asset_id);
+    }
+  }
+  const nodeIds = new Set((data.canvas.nodes || []).map((node) => node.id));
+  for (const node of archive.nodes || []) {
+    if (node.id && !nodeIds.has(node.id)) {
+      data.canvas.nodes.push(node);
+      nodeIds.add(node.id);
+    }
+  }
+  const edgeKey = (edge) => `${edge.source || ""}->${edge.target || ""}`;
+  const edgeKeys = new Set((data.canvas.edges || []).map(edgeKey));
+  for (const edge of archive.edges || []) {
+    if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+    const key = edgeKey(edge);
+    if (!edgeKeys.has(key)) {
+      data.canvas.edges.push(edge);
+      edgeKeys.add(key);
+    }
+  }
+  const jobIds = new Set((data.jobs || []).map((job) => job.job_id));
+  for (const job of archive.jobs || []) {
+    if (job.job_id && !jobIds.has(job.job_id)) data.jobs.push(job);
+  }
+  const shotIds = new Set((data.shots || []).map((shot) => String(shot.shot_id || "")));
+  for (const shot of archive.shots || []) {
+    if (shot.shot_id && !shotIds.has(String(shot.shot_id))) {
+      data.shots.push(shot);
+      shotIds.add(String(shot.shot_id));
+    }
+  }
+  const revisionIds = new Set((data.prompt_context.revisions || []).map((revision) => revision.revision_id));
+  for (const revision of archive.prompt_revisions || []) {
+    if (revision.revision_id && !revisionIds.has(revision.revision_id)) data.prompt_context.revisions.push(revision);
+  }
+  const segmentIds = new Set((data.script.segments || []).map((segment) => segment.segment_id));
+  for (const segment of archive.script_segments || []) {
+    if (segment.segment_id && !segmentIds.has(segment.segment_id)) data.script.segments.push(segment);
+  }
+  const bindingKeys = new Set((data.script.bindings || []).map((binding) => `${binding.shot_id}:${binding.segment_id}`));
+  for (const binding of archive.script_bindings || []) {
+    const key = `${binding.shot_id}:${binding.segment_id}`;
+    if (binding.shot_id && binding.segment_id && !bindingKeys.has(key)) data.script.bindings.push(binding);
+  }
+  data.tags = buildTags(data.shots, data.tags);
+  data.archives = (data.archives || []).filter((item) => item.archive_id !== archiveId);
+
+  saveProjectPart(projectId, "canvas.json", data.canvas);
+  saveProjectPart(projectId, "jobs.json", data.jobs);
+  saveProjectPart(projectId, "shots.json", data.shots);
+  saveProjectPart(projectId, "tags.json", data.tags);
+  saveProjectPart(projectId, "prompt_context.json", data.prompt_context);
+  saveProjectPart(projectId, "script.json", data.script);
+  saveProjectPart(projectId, "archives.json", data.archives);
+  return { data, archive };
+}
+
 async function resumeQueuedContinuousJobs(projectId) {
   const data = loadProject(projectId);
   const jobsToStart = [];
   let changed = false;
+  if (data.project?.queue_paused) {
+    for (const job of data.jobs || []) {
+      if (job.status !== "queued") continue;
+      const pausedReason = "队列已暂停：任务保持待提交，恢复提交后会继续。";
+      if (job.failure_reason !== pausedReason) {
+        job.failure_reason = pausedReason;
+        job.updated_at = now();
+        changed = true;
+      }
+    }
+    if (changed) saveProjectPart(projectId, "jobs.json", data.jobs);
+    return;
+  }
   for (const job of data.jobs || []) {
     if (job.status === "queued" && job.queue_reason === "waiting_prev_tail") {
       const prepared = await ensureContinuousShotTailFrame(projectId, data, job);
@@ -3001,13 +3422,22 @@ async function replyLovartJob(projectId, job, message) {
 }
 
 async function processLovartJobSubmission(projectId, jobId) {
+  activeJobSubmissions.add(jobId);
   const data = loadProject(projectId);
   const job = data.jobs.find((item) => item.job_id === jobId);
-  if (!job) return;
+  if (!job) {
+    activeJobSubmissions.delete(jobId);
+    return;
+  }
   const targetNode = data.canvas.nodes.find((node) => node.id === job.target_node_id) || null;
-  const result = job.platform === "jimeng_cli"
-    ? await runJimengJob(projectId, job, data.canvas)
-    : await runLovartJob(projectId, job, data.canvas);
+  let result;
+  try {
+    result = job.platform === "jimeng_cli"
+      ? await runJimengJob(projectId, job, data.canvas)
+      : await runLovartJob(projectId, job, data.canvas);
+  } finally {
+    activeJobSubmissions.delete(jobId);
+  }
   const fresh = loadProject(projectId);
   const storedJob = fresh.jobs.find((item) => item.job_id === jobId);
   if (!storedJob) return;
@@ -3029,7 +3459,10 @@ async function processLovartJobSubmission(projectId, jobId) {
       failure_reason: status === "running" ? "" : (result.reason || ""),
     });
     saveProjectPart(projectId, "jobs.json", fresh.jobs);
-    if (storedJob.platform === "lovart" && storedJob.lovart_thread_id && status !== "rate_limited") {
+    if (
+      (storedJob.platform === "lovart" && storedJob.lovart_thread_id && status !== "rate_limited")
+      || (storedJob.platform === "jimeng_cli" && status !== "rate_limited" && status !== "running")
+    ) {
       void resumeQueuedContinuousJobs(projectId).catch(() => {});
     }
     return;
@@ -3136,6 +3569,22 @@ async function handleApi(req, res) {
     await resumeQueuedContinuousJobs(projectId);
     const data = loadProject(projectId);
     return send(res, 200, {
+      project: data.project,
+      jobs: data.jobs,
+      canvas: data.canvas,
+      asset_library: data.asset_library,
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/jobs/queue-pause") {
+    const body = await readBody(req);
+    const projectId = body.project_id || "AI视频项目";
+    const project = setQueuePaused(projectId, body.paused);
+    await resumeQueuedContinuousJobs(projectId);
+    const data = loadProject(projectId);
+    return send(res, 200, {
+      ok: true,
+      project: data.project || project,
       jobs: data.jobs,
       canvas: data.canvas,
       asset_library: data.asset_library,
@@ -3146,11 +3595,69 @@ async function handleApi(req, res) {
     return send(res, 200, listProjects());
   }
 
+  if (req.method === "GET" && url.pathname === "/api/project/reuse-package") {
+    const projectId = url.searchParams.get("project_id") || "AI视频项目";
+    try {
+      return send(res, 200, { ok: true, package: exportProjectReusePackage(projectId) });
+    } catch (error) {
+      return send(res, 400, { ok: false, error: error.message || "导出项目复用包失败。" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/project/import-reuse-package") {
+    const body = await readBody(req);
+    try {
+      return send(res, 200, importProjectReusePackage(body.package, body.name));
+    } catch (error) {
+      return send(res, 400, { ok: false, error: error.message || "导入项目复用包失败。" });
+    }
+  }
+
   if (req.method === "POST" && url.pathname === "/api/canvas/save") {
     const body = await readBody(req);
     const nextCanvas = mergeCanvasForSave(body.project_id, body.canvas);
     saveProjectPart(body.project_id, "canvas.json", nextCanvas);
     return send(res, 200, { ok: true });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/archive/selected") {
+    const body = await readBody(req);
+    try {
+      const { data, archive } = archiveSelectedNodes(body.project_id, Array.isArray(body.node_ids) ? body.node_ids : []);
+      return send(res, 200, {
+        ok: true,
+        archive,
+        canvas: data.canvas,
+        shots: data.shots,
+        tags: data.tags,
+        jobs: data.jobs,
+        archives: data.archives,
+        prompt_context: data.prompt_context,
+        script: data.script,
+      });
+    } catch (error) {
+      return send(res, 400, { ok: false, error: error.message || "归档失败。" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/archive/restore") {
+    const body = await readBody(req);
+    try {
+      const { data, archive } = restoreArchive(body.project_id, String(body.archive_id || ""));
+      return send(res, 200, {
+        ok: true,
+        archive,
+        canvas: data.canvas,
+        shots: data.shots,
+        tags: data.tags,
+        jobs: data.jobs,
+        archives: data.archives,
+        prompt_context: data.prompt_context,
+        script: data.script,
+      });
+    } catch (error) {
+      return send(res, 400, { ok: false, error: error.message || "恢复归档失败。" });
+    }
   }
 
   if (req.method === "POST" && url.pathname === "/api/shots/parse-xlsx") {
@@ -3321,16 +3828,32 @@ async function handleApi(req, res) {
     if (!/^https?:\/\//i.test(rawUrl)) {
       return send(res, 400, { ok: false, error: "请输入可访问的 http 或 https 素材 URL。" });
     }
+    const dir = path.join(projectDir(body.project_id), "input");
+    ensureDir(dir);
+    const displayName = safeName(body.name || assetNameFromUrl(rawUrl));
+    let filePath = "";
+    try {
+      const downloaded = await downloadRemoteFile(rawUrl, path.join(dir, displayName));
+      filePath = downloaded.filePath;
+    } catch (error) {
+      return send(res, 400, {
+        ok: false,
+        error: `URL 素材下载失败，没有写入本地文件夹：${error.message || "下载失败"}`,
+      });
+    }
+    const kind = body.kind || assetKindFromUrl(rawUrl);
     const asset = {
       asset_id: id("asset"),
-      name: safeName(body.name || assetNameFromUrl(rawUrl)),
-      kind: body.kind || assetKindFromUrl(rawUrl),
+      name: path.basename(filePath, path.extname(filePath)) || displayName,
+      kind,
       source: "input",
       is_library_asset: Boolean(body.is_library_asset),
       asset_category: body.asset_category || undefined,
       asset_template_id: body.asset_template_id || undefined,
       external_url: rawUrl,
-      url: rawUrl,
+      file_path: filePath,
+      thumbnail_path: kind === "image" ? filePath : undefined,
+      url: publicAssetUrl(body.project_id, filePath),
     };
     const data = loadProject(body.project_id);
     data.canvas.assets.push(asset);
@@ -3595,6 +4118,12 @@ async function handleApi(req, res) {
       });
     }
     const collected = collectInputs(data.canvas, [targetNode.id]);
+    const hasGlobalControl = data.canvas.edges
+      .filter((edge) => edge.target === targetNode.id)
+      .some((edge) => data.canvas.nodes.find((node) => node.id === edge.source)?.type === "globalControl");
+    if (!hasGlobalControl) {
+      return send(res, 400, { ok: false, error: "请先连接至少 1 个全局控制节点，再提交生成任务。" });
+    }
     const prompt = [targetNode.data?.prompt, ...collected.promptParts].filter(Boolean).join("\n\n").trim();
     if (!prompt) return send(res, 400, { ok: false, error: "请先连接文本节点，或在生成节点里填写提示词。" });
 
@@ -3869,6 +4398,7 @@ module.exports = {
   assetsFromLovartResult,
   assetTemplateOutputName,
   blockingJobs,
+  buildReferencePromptText,
   buildTags,
   canStartQueuedJob,
   cleanGeneratedAssets,
@@ -3877,6 +4407,9 @@ module.exports = {
   defaultPromptFeedbackPresets,
   deepSeekHttpErrorMessage,
   extractJsonObject,
+  ensureJimengLocalAsset,
+  exportProjectReusePackage,
+  importProjectReusePackage,
   isJimengVipModel,
   jobBlocksSubmission,
   loadProject,
