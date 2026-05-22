@@ -200,6 +200,34 @@ function fileSizeBytes(filePath) {
   }
 }
 
+function imageQualityToFfmpegQscale(quality) {
+  const normalized = Math.max(45, Math.min(92, Number(quality || 82)));
+  return Math.max(2, Math.min(18, Math.round(22 - ((normalized - 45) / 47) * 16)));
+}
+
+async function convertImageToJpeg(source, dest, options = {}) {
+  const maxEdge = Math.max(512, Math.min(4096, Number(options.maxEdge || 2048)));
+  const quality = Math.max(45, Math.min(92, Number(options.quality || 82)));
+  const logFile = options.logFile;
+  if (process.platform === "darwin" && fs.existsSync("/usr/bin/sips")) {
+    return runCommand("/usr/bin/sips", [
+      "-s", "format", "jpeg",
+      "-s", "formatOptions", String(quality),
+      "-Z", String(maxEdge),
+      source,
+      "--out", dest,
+    ], logFile, {}, { timeoutMs: options.timeoutMs || 30000 });
+  }
+  const scale = `scale=trunc(iw*min(1\\,${maxEdge}/max(iw\\,ih))/2)*2:trunc(ih*min(1\\,${maxEdge}/max(iw\\,ih))/2)*2`;
+  return runCommand(FFMPEG, [
+    "-y",
+    "-i", source,
+    "-vf", scale,
+    "-q:v", String(imageQualityToFfmpegQscale(quality)),
+    dest,
+  ], logFile, {}, { timeoutMs: options.timeoutMs || 60000 });
+}
+
 async function compressImageAsset(projectId, asset, options = {}) {
   if (!asset || asset.kind !== "image") throw new Error("只能压缩图片素材。");
   if (!asset.file_path || !fs.existsSync(asset.file_path)) throw new Error("这个图片还没有本地文件，不能直接压缩。");
@@ -217,13 +245,12 @@ async function compressImageAsset(projectId, asset, options = {}) {
   const logDir = path.join(projectRoot, "logs");
   ensureDir(logDir);
   const logFile = path.join(logDir, `compress_image_${Date.now()}.log`);
-  const result = await runCommand("/usr/bin/sips", [
-    "-s", "format", "jpeg",
-    "-s", "formatOptions", String(quality),
-    "-Z", String(maxEdge),
-    source,
-    "--out", dest,
-  ], logFile, {}, { timeoutMs: 30000 });
+  const result = await convertImageToJpeg(source, dest, {
+    maxEdge,
+    quality,
+    logFile,
+    timeoutMs: 60000,
+  });
   if (!result.ok || !fs.existsSync(dest)) {
     try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
     throw new Error(result.error || "图片压缩失败。");
@@ -1239,13 +1266,12 @@ async function stageJimengUploadFile(projectId, job, sourcePath, index, kind, lo
   const shouldOptimizeImage = safeKind === "image" && /\.(png|jpe?g|webp)$/i.test(ext);
   const destPath = path.join(destDir, `${safeKind}_${String(index + 1).padStart(2, "0")}${shouldOptimizeImage ? ".jpg" : ext}`);
   if (shouldOptimizeImage) {
-    const result = await runCommand("/usr/bin/sips", [
-      "-s", "format", "jpeg",
-      "-s", "formatOptions", "86",
-      "-Z", "2048",
-      sourcePath,
-      "--out", destPath,
-    ], logFile, {}, { timeoutMs: 30000 });
+    const result = await convertImageToJpeg(sourcePath, destPath, {
+      maxEdge: 2048,
+      quality: 86,
+      logFile,
+      timeoutMs: 60000,
+    });
     if (result.ok && fs.existsSync(destPath)) return destPath;
   }
   fs.copyFileSync(sourcePath, destPath);

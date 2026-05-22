@@ -59,6 +59,22 @@ macOS 如果已经有 Homebrew：
 brew install ffmpeg
 ```
 
+Windows 推荐：
+
+1. 打开 [https://www.gyan.dev/ffmpeg/builds/](https://www.gyan.dev/ffmpeg/builds/)
+2. 下载 `ffmpeg-release-essentials.zip`
+3. 解压到例如：
+
+```text
+C:\Tools\ffmpeg
+```
+
+4. 把下面这个目录加入系统 `Path`：
+
+```text
+C:\Tools\ffmpeg\bin
+```
+
 安装后确认：
 
 ```bash
@@ -125,6 +141,30 @@ ffmpeg -version
 再人工确认：
 
 - 左侧 `Lovart 配置` 里的 key 和 skill 路径，已经改成自己机器上的值
+
+## Windows 迁移说明
+
+推荐迁移方式不是直接复制旧项目目录，而是使用项目复用包：
+
+1. 在旧电脑打开当前项目。
+2. 点击 `打开/创建项目`。
+3. 点击 `导出当前项目复用包`，得到 `.aivideopack` 文件。
+4. 在 Windows 电脑打开工具。
+5. 点击 `打开/创建项目`。
+6. 点击 `导入复用包创建项目`，选择 `.aivideopack` 文件。
+
+复用包会带走标签、已绑定资产、素材库、全局控制模板和素材文件；不会带走任务记录、旧画布成品节点和生成历史。
+
+Windows 上需要自己配置的内容：
+
+- Node.js LTS
+- Python，可在终端运行 `python --version`
+- Lovart skill 路径，例如 `C:\Users\你的用户名\.codex\skills\lovart-skill\agent_skill.py`
+- Lovart Access Key 和 Secret Key
+- `dreamina` CLI，并确认 `dreamina user_credit` 可用
+- `ffmpeg / ffprobe`，用于提取尾帧和跨平台图片压缩
+
+即梦提交时工具会清掉 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 这些代理环境变量。这不是限制，而是为了避免即梦这个国内服务误走本地代理；如果你的 Windows 必须通过代理访问即梦，需要先在系统层确认 `dreamina` CLI 本身能直接运行成功。
 
 ### 常见问题
 
