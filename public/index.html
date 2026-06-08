@@ -257,7 +257,10 @@
         </section>
 
         <section data-right-panel="review" hidden>
-          <h2>项目复盘</h2>
+          <div class="panel-title-row">
+            <h2>项目复盘</h2>
+            <button id="exportReviewMarkdown" type="button">导出 MD</button>
+          </div>
           <div id="reviewList" class="review-list"></div>
         </section>
       </aside>
@@ -265,7 +268,7 @@
 
     <div id="videoPreviewModal" class="modal" hidden>
       <div class="modal-backdrop" data-close-preview></div>
-      <div class="modal-panel">
+      <div class="modal-panel shot-conflict-panel">
         <div class="modal-header">
           <strong id="videoPreviewTitle">视频预览</strong>
           <button data-close-preview>关闭</button>
@@ -279,7 +282,7 @@
 
     <div id="shotConflictModal" class="modal" hidden>
       <div class="modal-backdrop" data-close-shot-conflict></div>
-      <div class="modal-panel">
+      <div class="modal-panel shot-conflict-panel">
         <div class="modal-header">
           <strong>分镜冲突处理</strong>
           <button data-close-shot-conflict>关闭</button>

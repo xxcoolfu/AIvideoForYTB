@@ -331,12 +331,14 @@ function mergeCanvasForSave(projectId, incomingCanvas = {}) {
   });
   next.nodes.push(...preservedNodes);
   preservedNodes.forEach((node) => nextNodeIds.add(node.id));
+  const preservedNodeIds = new Set(preservedNodes.map((node) => node.id).filter(Boolean));
 
   const edgeKey = (edge) => `${edge.source || ""}->${edge.target || ""}`;
   const nextEdgeKeys = new Set(next.edges.map(edgeKey));
   for (const edge of current.edges || []) {
     if (!edge.source || !edge.target) continue;
     if (!nextNodeIds.has(edge.source) || !nextNodeIds.has(edge.target)) continue;
+    if (!preservedNodeIds.has(edge.source) && !preservedNodeIds.has(edge.target)) continue;
     const key = edgeKey(edge);
     if (nextEdgeKeys.has(key)) continue;
     next.edges.push(edge);
@@ -851,14 +853,11 @@ function parseShots(text) {
 function extractTags(text) {
   const source = String(text || "");
   const refs = new Set();
-  for (const match of source.matchAll(/^\s*@([^@\n]{1,120}?)\s+[—–-]\s+/gmu)) {
-    const label = String(match[1] || "").replace(/\s+/g, " ").trim();
-    if (label) refs.add(`@${label}`);
-  }
-  for (const token of source.match(/@(?:[A-Za-z][A-Za-z0-9_\-·]*|[\p{Script=Han}\p{N}_\-·]+)/gu) || []) {
-    const label = token.trim();
-    const isShortPrefix = Array.from(refs).some((fullLabel) => fullLabel !== label && fullLabel.startsWith(`${label} `));
-    if (!isShortPrefix) refs.add(label);
+  for (const line of source.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("@")) continue;
+    const body = trimmed.slice(1).replace(/\s+/g, " ").trim();
+    if (body) refs.add(`@${body}`);
   }
   return Array.from(refs);
 }
@@ -913,6 +912,14 @@ function mapImportedVideoModel(rawModel, preferredSeedancePlatform = "lovart") {
     "seedance2.0fast_vip": {
       lovart: "generate_video_seedance_v2_0_fast",
       jimeng_cli: "seedance2.0fast_vip",
+    },
+    "generate_video_seedance_v2_0": {
+      lovart: "generate_video_seedance_v2_0",
+      jimeng_cli: "seedance2.0",
+    },
+    "generate_video_seedance_v2_0_fast": {
+      lovart: "generate_video_seedance_v2_0_fast",
+      jimeng_cli: "seedance2.0fast",
     },
   };
   if (seedanceMap[lower]) return seedanceMap[lower][seedancePlatform];
@@ -1575,10 +1582,82 @@ function isConcurrentLimit(message) {
   return /Concurrent task limit|ExceedConcurrencyLimit|ConcurrencyLimit|并发|concurrent|concurrency/i.test(String(message || ""));
 }
 
+function humanizeJimengFailureReason(reason = "") {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  if (isConcurrentLimit(text)) return "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
+  if (/spawn EBADF/i.test(text)) {
+    return "本地图片预处理命令启动失败，任务还没有提交到即梦。已改为预处理失败时自动降级，请重新提交。";
+  }
+  if (/bad gateway|code\s*201007|commit phase/i.test(text)) {
+    return "即梦上传提交阶段平台网关失败，任务没有成功进入生成。通常是平台上传链路临时异常，建议稍后重新提交。";
+  }
+  if (/upload phase|no file upload/i.test(text)) {
+    return "即梦上传文件阶段失败，任务没有成功进入生成。通常是图片上传链路或文件读取异常，建议重新提交；若反复出现，先减少参考图数量。";
+  }
+  if (/^exit code 1$/i.test(text)) {
+    return "即梦 CLI 已启动但无错误详情地退出，任务没有成功进入生成。建议重新提交；若连续出现，先检查 dreamina user_credit 和参考图数量。";
+  }
+  if (/command timed out/i.test(text)) {
+    return "即梦 CLI 提交超时，任务没有拿到平台返回。建议稍后重新提交，或减少本次参考图数量。";
+  }
+  return text;
+}
+
 function jimengFailureReason(parsed = {}, fallback = "即梦平台退回失败。") {
   const reason = String(parsed.fail_reason || parsed.message || parsed.error || "").trim();
-  if (isConcurrentLimit(reason)) return "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
-  return reason || fallback;
+  return humanizeJimengFailureReason(reason) || fallback;
+}
+
+function isJimengFinalGenerationFailure(reason = "") {
+  return /generation failed:\s*final generation failed|final generation failed/i.test(String(reason || ""));
+}
+
+const JIMENG_FINAL_FAILURE_AUTO_RETRY_WINDOW_MS = 2 * 60 * 1000;
+const JIMENG_FINAL_FAILURE_AUTO_RETRY_LIMIT = 2;
+
+function jimengSubmittedAgeMs(job = {}, nowMs = Date.now()) {
+  const submittedAt = Date.parse(String(job.submitted_at || ""));
+  if (!Number.isFinite(submittedAt)) return Infinity;
+  return nowMs - submittedAt;
+}
+
+function canAutoRetryJimengJob(job = {}, reason = "", options = {}) {
+  if (job.platform !== "jimeng_cli") return false;
+  if (!isJimengFinalGenerationFailure(reason)) return false;
+  const count = Number(job.auto_retry_count || 0);
+  const retryLimit = Number(options.retryLimit || JIMENG_FINAL_FAILURE_AUTO_RETRY_LIMIT);
+  if (!Number.isFinite(count) || count >= retryLimit) return false;
+  const maxAgeMs = Number(options.maxAgeMs || JIMENG_FINAL_FAILURE_AUTO_RETRY_WINDOW_MS);
+  const ageMs = jimengSubmittedAgeMs(job, options.nowMs);
+  return ageMs >= 0 && ageMs <= maxAgeMs;
+}
+
+function queueJimengAutoRetry(job = {}, reason = "") {
+  const previousSubmitId = job.jimeng_submit_id || "";
+  const previousSubmittedAt = job.submitted_at || "";
+  job.auto_retry_count = Number(job.auto_retry_count || 0) + 1;
+  job.auto_retry_history = [
+    ...(Array.isArray(job.auto_retry_history) ? job.auto_retry_history : []),
+    {
+      at: now(),
+      reason: String(reason || "").trim(),
+      previous_submit_id: previousSubmitId,
+      previous_submitted_at: previousSubmittedAt,
+    },
+  ];
+  job.status = "queued";
+  job.queue_reason = "waiting_turn";
+  job.failure_reason = `即梦提交后 2 分钟内返回最终生成失败，已自动重提 ${job.auto_retry_count} 次，正在排队重新提交。`;
+  job.jimeng_submit_id = "";
+  delete job.submitted_at;
+  job.updated_at = now();
+  return job;
+}
+
+function jimengQueryTimeoutPendingReason(timeoutMs = DREAMINA_QUERY_TIMEOUT_MS) {
+  const seconds = Math.round(Number(timeoutMs || 0) / 1000);
+  return `即梦本次查询超过 ${seconds} 秒，平台可能仍在生成。系统会继续自动查询，不判定失败。`;
 }
 
 function rateLimitHandledReason(job = {}) {
@@ -1631,6 +1710,7 @@ function assetTagLabelIndex(tags = []) {
 function referenceRoleLabel(role) {
   return {
     first_frame: "首帧参考",
+    tail_frame: "尾帧参考",
     character_reference: "角色参考",
     scene_reference: "场景参考",
     prop_reference: "道具参考",
@@ -1718,7 +1798,7 @@ function buildJobInputAssets(data, targetNode, kind, collected) {
     return {
       ...input,
       order: index + 1,
-      asset_name: asset?.name || input.source_node_title || input.asset_id,
+      asset_name: String(input.source_node_title || asset?.name || input.asset_id || "").trim(),
       asset_kind: asset?.kind || input.source_node_type || "image",
       asset_category: asset?.asset_category || "",
       tag_labels: tagLabels,
@@ -1738,6 +1818,9 @@ function buildReferencePromptText(kind, inputAssets = [], parameters = {}) {
     : [
         parameters.feature === "first_frame" || inputAssets.some((item) => item.reference_role === "first_frame")
           ? "请严格使用被标记为“首帧参考”的附件作为起始画面。"
+          : "",
+        inputAssets.some((item) => item.reference_role === "tail_frame")
+          ? "被标记为“尾帧参考”的附件只用于理解目标结束画面或上一镜尾帧，不要当成首帧。"
           : "",
         "角色参考只用于角色一致性，场景参考只用于空间与布光，道具参考只用于物体细节。",
         "不要混淆各附件编号、图片编号和用途；若模型无法遵守，请直接说明具体原因。",
@@ -1835,6 +1918,22 @@ function jimengReferenceName(item = {}) {
     .trim();
 }
 
+function jimengReferenceFallbackName(item = {}, mediaLabel = "参考素材") {
+  const roleLabel = referenceRoleLabel(item.reference_role || "reference");
+  return String(item.primary_tag_label || item.asset_name || item.asset?.name || roleLabel || item.asset_id || mediaLabel || "参考素材")
+    .replace(/^@/, "")
+    .trim();
+}
+
+function jimengReferenceLine(mediaLabel, item = {}) {
+  const roleLabel = referenceRoleLabel(item.reference_role || "reference");
+  if (item.reference_role === "first_frame" && !String(item.primary_tag_label || "").trim()) {
+    return `@${mediaLabel}=首帧参考`;
+  }
+  const name = jimengReferenceName(item) || jimengReferenceFallbackName(item, mediaLabel);
+  return name === roleLabel ? `@${mediaLabel}=${roleLabel}` : `@${mediaLabel}=${name}（${roleLabel}）`;
+}
+
 function buildJimengReferencePrompt(orderedInputs = [], mode = "") {
   if (!orderedInputs.length) return "";
   const imageLines = [];
@@ -1844,17 +1943,18 @@ function buildJimengReferencePrompt(orderedInputs = [], mode = "") {
   let videoIndex = 0;
   let audioIndex = 0;
   for (const item of orderedInputs) {
-    const name = jimengReferenceName(item);
-    if (!name) continue;
     if (item.asset?.kind === "image") {
       imageIndex += 1;
-      imageLines.push(`@图片${imageIndex}=${name}`);
+      const mediaLabel = `图片${imageIndex}`;
+      imageLines.push(jimengReferenceLine(mediaLabel, item));
     } else if (item.asset?.kind === "video") {
       videoIndex += 1;
-      videoLines.push(`@视频${videoIndex}=${name}`);
+      const mediaLabel = `视频${videoIndex}`;
+      videoLines.push(jimengReferenceLine(mediaLabel, item));
     } else if (item.asset?.kind === "audio") {
       audioIndex += 1;
-      audioLines.push(`@音频${audioIndex}=${name}`);
+      const mediaLabel = `音频${audioIndex}`;
+      audioLines.push(jimengReferenceLine(mediaLabel, item));
     }
   }
   const lines = [...imageLines, ...videoLines, ...audioLines];
@@ -1914,10 +2014,6 @@ function maskSecrets(text, secrets) {
 function runCommand(cmd, args, logFile, extraEnv = {}, options = {}) {
   return new Promise((resolve) => {
     let settled = false;
-    const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...extraEnv },
-    });
     let stdout = "";
     let stderr = "";
     const finish = (result) => {
@@ -1925,6 +2021,19 @@ function runCommand(cmd, args, logFile, extraEnv = {}, options = {}) {
       settled = true;
       resolve(result);
     };
+    let child;
+    try {
+      child = spawn(cmd, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, ...extraEnv },
+      });
+    } catch (error) {
+      try {
+        fs.writeFileSync(logFile, `COMMAND: ${cmd} ${args.join(" ")}\n\nERROR:\n${maskSecrets(error.message, [extraEnv.LOVART_ACCESS_KEY, extraEnv.LOVART_SECRET_KEY])}\n`);
+      } catch {}
+      finish({ ok: false, error: error.message, stdout, stderr, code: null });
+      return;
+    }
     const timeout = options.timeoutMs
       ? setTimeout(() => {
           const message = `command timed out after ${options.timeoutMs}ms`;
@@ -2011,6 +2120,17 @@ function htmlCellTextByClass(rowHtml, className) {
   return htmlToPlainText(String(rowHtml || "").match(pattern)?.[1] || "");
 }
 
+function htmlCellHtmlByClass(rowHtml, className) {
+  const pattern = new RegExp(`<td\\b[^>]*class=["'][^"']*\\b${className}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/td>`, "i");
+  return String(rowHtml || "").match(pattern)?.[1] || "";
+}
+
+function promptBlockTextFromCell(cellHtml, blockClassName) {
+  const pattern = new RegExp(`<div\\b[^>]*class=["'][^"']*\\b${blockClassName}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/div>`, "i");
+  const block = String(cellHtml || "").match(pattern)?.[1] || "";
+  return htmlToPlainText(block);
+}
+
 function transitionFromImportedLabel(value) {
   const text = String(value || "").trim().replace(/\s+/g, "");
   if (!text) return "video_direct";
@@ -2049,17 +2169,18 @@ function parseShotlistHtml(html, preferredSeedancePlatform = "lovart") {
       const promptNumber = headText.match(/提示词\s*(\d+)/)?.[1] || String(shots.length + 1);
       const video_prompt = htmlToPlainText(promptBlockMatch[1]);
       if (!video_prompt) continue;
+      const image_prompt = promptBlockTextFromCell(htmlCellHtmlByClass(rowHtml, "c-image-prompt"), "image-prompt-block");
       const video_model = htmlCellTextByClass(rowHtml, "c-model");
       const transition = transitionFromImportedLabel(htmlCellTextByClass(rowHtml, "c-link"));
       shots.push(normalizeShot({
         shot_id: `分镜${episode}-${scene}-${promptNumber}`,
         transition,
-        image_prompt: "",
+        image_prompt,
         video_prompt,
         video_model,
         duration: extractDurationFromPrompt(video_prompt),
         size: extractAspectRatioFromPrompt(video_prompt),
-        tag_refs: extractTags(video_prompt),
+        tag_refs: extractTags([image_prompt, video_prompt].filter(Boolean).join("\n\n")),
         platform: "",
       }, shots[shots.length - 1]?.shot_id || "", preferredSeedancePlatform));
     }
@@ -2366,7 +2487,8 @@ async function runJimengJob(projectId, job, canvas) {
   job.submitted_command = `${DREAMINA} ${args.join(" ")}`;
   const result = await runCommand(DREAMINA, args, logFile, DIRECT_NETWORK_ENV, { timeoutMs: DREAMINA_SUBMIT_TIMEOUT_MS });
   if (!result.ok) {
-    return { ok: false, reason: result.error || "即梦 CLI 调用失败" };
+    const detail = [result.error, result.stderr, result.stdout].map((item) => String(item || "").trim()).find(Boolean);
+    return { ok: false, reason: humanizeJimengFailureReason(detail) || "即梦 CLI 调用失败" };
   }
   saveProjectPart(projectId, "canvas.json", canvas);
   let parsed;
@@ -2380,6 +2502,7 @@ async function runJimengJob(projectId, job, canvas) {
   if (!job.jimeng_submit_id) {
     return { ok: false, reason: "即梦提交成功了，但没有返回 submit_id。" };
   }
+  job.submitted_at = now();
   if (genStatus && genStatus !== "querying" && genStatus !== "running") {
     return { ok: false, reason: jimengFailureReason(parsed, `即梦提交状态异常：${genStatus}`) };
   }
@@ -2444,7 +2567,16 @@ async function refreshDreaminaJob(projectId, job) {
     outputDir,
   ], logFile, DIRECT_NETWORK_ENV, { timeoutMs: DREAMINA_QUERY_TIMEOUT_MS });
   if (!result.ok) {
-    return { ok: false, reason: result.error || "即梦结果刷新失败" };
+    if (result.timedOut) {
+      return {
+        ok: false,
+        pending: true,
+        status: "running",
+        reason: jimengQueryTimeoutPendingReason(DREAMINA_QUERY_TIMEOUT_MS),
+      };
+    }
+    const detail = [result.error, result.stderr, result.stdout].map((item) => String(item || "").trim()).find(Boolean);
+    return { ok: false, reason: humanizeJimengFailureReason(detail) || "即梦结果刷新失败" };
   }
   let parsed;
   try {
@@ -2642,6 +2774,62 @@ function attachGeneratedAssetsToTemplate(projectId, job, assets) {
   });
 }
 
+function deleteQueuedJobFromProject(projectId, jobId) {
+  const data = loadProject(projectId);
+  const index = (data.jobs || []).findIndex((job) => job.job_id === jobId);
+  if (index < 0) {
+    return { ok: false, status: 404, error: "找不到任务。" };
+  }
+  const job = data.jobs[index];
+  if (job.status !== "queued") {
+    return { ok: false, status: 400, error: "只能删除待提交任务；已提交到平台的任务请保留记录。" };
+  }
+  data.jobs.splice(index, 1);
+  saveProjectPart(projectId, "jobs.json", data.jobs);
+  const assetLibrary = job.asset_template_id
+    ? updateAssetLibraryAfterJob(projectId, job, { status: "idle", failure_reason: "" })
+    : data.asset_library;
+  return { ok: true, deleted_job: job, jobs: data.jobs, asset_library: assetLibrary || loadProject(projectId).asset_library };
+}
+
+function requeueFailedJobFromProject(projectId, jobId) {
+  const data = loadProject(projectId);
+  const job = (data.jobs || []).find((item) => item.job_id === jobId);
+  if (!job) return { ok: false, status: 404, error: "找不到任务。" };
+  if (job.status !== "failed") {
+    return { ok: false, status: 400, error: "只有失败任务可以重新提交。" };
+  }
+  if (!ENABLED_PLATFORMS.has(normalizePlatform(job.platform))) {
+    return { ok: false, status: 400, error: "这个任务的平台当前不能提交。" };
+  }
+  const previousSubmitId = job.jimeng_submit_id || job.lovart_thread_id || "";
+  job.manual_retry_count = Number(job.manual_retry_count || 0) + 1;
+  job.manual_retry_history = [
+    ...(Array.isArray(job.manual_retry_history) ? job.manual_retry_history : []),
+    {
+      at: now(),
+      reason: String(job.failure_reason || "").trim(),
+      previous_platform_id: previousSubmitId,
+      previous_submitted_at: job.submitted_at || "",
+    },
+  ];
+  job.status = "queued";
+  job.queue_reason = "waiting_turn";
+  job.failure_reason = "已重新加入任务队列，待提交。";
+  job.output_asset_ids = [];
+  job.processed_download_keys = [];
+  job.auto_retry_count = 0;
+  delete job.submitted_at;
+  delete job.jimeng_submit_id;
+  delete job.lovart_thread_id;
+  delete job.pending_confirmation;
+  job.updated_at = now();
+  updateAssetLibraryAfterJob(projectId, job, { status: "queued", failure_reason: job.failure_reason });
+  saveProjectPart(projectId, "jobs.json", data.jobs);
+  void resumeQueuedContinuousJobs(projectId).catch(() => {});
+  return { ok: true, job, jobs: data.jobs, canvas: data.canvas, asset_library: loadProject(projectId).asset_library };
+}
+
 function assetTemplateOutputName(job, suffix = "") {
   const raw = String(job.asset_template_filename || job.asset_template_label || "").trim().replace(/^@/, "");
   const base = path.basename(raw || "asset");
@@ -2653,6 +2841,22 @@ function isJimengVipModel(model) {
   return /_vip$/i.test(String(model || "").trim());
 }
 
+function jimengConcurrencyModel(model) {
+  return normalizeJimengModel(model, "").trim();
+}
+
+function isJimengRotatableSeedanceModel(model) {
+  const normalized = jimengConcurrencyModel(model);
+  return normalized === "seedance2.0fast" || normalized === "seedance2.0";
+}
+
+function alternateJimengSeedanceModel(model) {
+  const normalized = jimengConcurrencyModel(model);
+  if (normalized === "seedance2.0fast") return "seedance2.0";
+  if (normalized === "seedance2.0") return "seedance2.0fast";
+  return normalized;
+}
+
 function activeJobsForPlatform(jobs = [], platform = "lovart") {
   const normalizedPlatform = normalizePlatform(platform);
   return (jobs || []).filter((job) => {
@@ -2662,12 +2866,31 @@ function activeJobsForPlatform(jobs = [], platform = "lovart") {
   });
 }
 
+function activeJimengJobsForModel(jobs = [], model = "") {
+  const normalizedModel = jimengConcurrencyModel(model);
+  return activeJobsForPlatform(jobs, "jimeng_cli").filter((job) => {
+    const jobModel = jimengConcurrencyModel(job.parameters?.model);
+    return normalizedModel && jobModel === normalizedModel;
+  });
+}
+
 function hasPendingRateLimitForPlatform(jobs = [], platform = "lovart") {
   const normalizedPlatform = normalizePlatform(platform);
   return (jobs || []).some((job) => (
     job.status === "rate_limited"
     && !job.rate_limit_handled
     && normalizePlatform(job.platform || "lovart") === normalizedPlatform
+  ));
+}
+
+function hasPendingRateLimitForJimengModel(jobs = [], model = "") {
+  const normalizedModel = jimengConcurrencyModel(model);
+  if (!normalizedModel) return false;
+  return (jobs || []).some((job) => (
+    job.status === "rate_limited"
+    && !job.rate_limit_handled
+    && normalizePlatform(job.platform || "lovart") === "jimeng_cli"
+    && jimengConcurrencyModel(job.parameters?.model) === normalizedModel
   ));
 }
 
@@ -2682,6 +2905,26 @@ function hasSubmittingJobForPlatform(jobs = [], platform = "lovart") {
   });
 }
 
+function canStartJimengQueuedJobWithModel(jobs = [], model = "") {
+  if (isJimengVipModel(model)) return true;
+  if (!isJimengRotatableSeedanceModel(model)) {
+    return activeJobsForPlatform(jobs, "jimeng_cli").length === 0
+      && !(hasPendingRateLimitForPlatform(jobs, "jimeng_cli") && activeJobsForPlatform(jobs, "jimeng_cli").length > 0);
+  }
+  const activeCount = activeJimengJobsForModel(jobs, model).length;
+  if (hasPendingRateLimitForJimengModel(jobs, model) && activeCount > 0) return false;
+  return activeCount === 0;
+}
+
+function chooseJimengQueueModel(jobs = [], job = {}) {
+  const current = jimengConcurrencyModel(job.parameters?.model);
+  if (!isJimengRotatableSeedanceModel(current)) return current;
+  if (canStartJimengQueuedJobWithModel(jobs, current)) return current;
+  const alternate = alternateJimengSeedanceModel(current);
+  if (canStartJimengQueuedJobWithModel(jobs, alternate)) return alternate;
+  return current;
+}
+
 function canStartQueuedJob(jobs = [], job = {}) {
   const platform = normalizePlatform(job.platform || "lovart");
   const activeCount = activeJobsForPlatform(jobs, platform).length;
@@ -2690,8 +2933,8 @@ function canStartQueuedJob(jobs = [], job = {}) {
     if (hasSubmittingJobForPlatform(jobs, "lovart")) return false;
     return activeCount < 9;
   }
+  if (platform === "jimeng_cli") return canStartJimengQueuedJobWithModel(jobs, job.parameters?.model);
   if (hasPendingRateLimitForPlatform(jobs, platform) && activeCount > 0) return false;
-  if (platform === "jimeng_cli" && isJimengVipModel(job.parameters?.model)) return true;
   return activeCount === 0;
 }
 
@@ -2701,7 +2944,13 @@ function jobBlocksSubmission(job = {}, incoming = {}, jobs = []) {
   const incomingPlatform = normalizePlatform(incoming.platform || "lovart");
   if (jobPlatform !== incomingPlatform) return false;
   if (incomingPlatform === "jimeng_cli" && isJimengVipModel(incoming.model)) return false;
-  if (incomingPlatform === "jimeng_cli") return activeJobsForPlatform(jobs, incomingPlatform).length > 0;
+  if (incomingPlatform === "jimeng_cli") {
+    const incomingModel = jimengConcurrencyModel(incoming.model);
+    if (isJimengRotatableSeedanceModel(incomingModel)) {
+      return activeJimengJobsForModel(jobs, incomingModel).length > 0;
+    }
+    return activeJobsForPlatform(jobs, incomingPlatform).length > 0;
+  }
   return true;
 }
 
@@ -3017,6 +3266,76 @@ function archiveSelectedNodes(projectId, nodeIds = []) {
   return { data, archive };
 }
 
+function deleteShotsFromProject(projectId, shotIds = []) {
+  const data = loadProject(projectId);
+  const shotIdSet = new Set((shotIds || []).map((item) => String(item || "").trim()).filter(Boolean));
+  if (!shotIdSet.size) throw new Error("先选择要删除的分镜。");
+
+  const existingShotIds = new Set((data.shots || []).map((shot) => String(shot.shot_id || "")));
+  const deletableShotIds = new Set([...shotIdSet].filter((shotId) => existingShotIds.has(shotId)));
+  if (!deletableShotIds.size) throw new Error("没有找到要删除的分镜。");
+
+  const removeNodeIds = new Set((data.canvas.nodes || [])
+    .filter((node) => intersectsSet(nodeShotIds(node), deletableShotIds))
+    .map((node) => node.id));
+  const relatedJobs = (data.jobs || []).filter((job) => (
+    removeNodeIds.has(job.target_node_id)
+    || intersectsSet(jobShotIds(job), deletableShotIds)
+  ));
+  const activeStatuses = new Set(["queued", "running", "rate_limited", "pending_confirmation", "needs_input"]);
+  const activeJob = relatedJobs.find((job) => activeStatuses.has(job.status));
+  if (activeJob) {
+    const shotText = jobShotIds(activeJob).join("、") || activeJob.job_id;
+    throw new Error(`分镜 ${shotText} 还有未结束任务，先等它完成或处理失败后再删除。`);
+  }
+
+  const outputAssetIds = new Set(relatedJobs.flatMap((job) => job.output_asset_ids || []));
+  for (const node of data.canvas.nodes || []) {
+    if (node.data?.asset_id && outputAssetIds.has(node.data.asset_id)) removeNodeIds.add(node.id);
+  }
+
+  const removedNodes = (data.canvas.nodes || []).filter((node) => removeNodeIds.has(node.id));
+  data.canvas.nodes = (data.canvas.nodes || []).filter((node) => !removeNodeIds.has(node.id));
+  data.canvas.edges = (data.canvas.edges || []).filter((edge) => !removeNodeIds.has(edge.source) && !removeNodeIds.has(edge.target));
+  const remainingNodeAssetIds = new Set(data.canvas.nodes.map((node) => node.data?.asset_id).filter(Boolean));
+  const removedNodeAssetIds = new Set(removedNodes.map((node) => node.data?.asset_id).filter(Boolean));
+  const removableAssetIds = new Set((data.canvas.assets || [])
+    .filter((asset) => removedNodeAssetIds.has(asset.asset_id))
+    .filter((asset) => (asset.source === "generated" || asset.source_job_id) && !remainingNodeAssetIds.has(asset.asset_id))
+    .map((asset) => asset.asset_id));
+  data.canvas.assets = (data.canvas.assets || []).filter((asset) => !removableAssetIds.has(asset.asset_id));
+
+  const relatedJobIds = new Set(relatedJobs.map((job) => job.job_id));
+  data.jobs = (data.jobs || []).filter((job) => !relatedJobIds.has(job.job_id));
+  data.shots = (data.shots || []).filter((shot) => !deletableShotIds.has(String(shot.shot_id || "")));
+  data.tags = buildTags(data.shots, data.tags);
+  data.prompt_context.revisions = (data.prompt_context.revisions || []).filter((revision) => (
+    !deletableShotIds.has(String(revision.shot_id || ""))
+    && !removeNodeIds.has(String(revision.node_id || ""))
+  ));
+  const removedBindings = (data.script.bindings || []).filter((binding) => deletableShotIds.has(String(binding.shot_id || "")));
+  const removedSegmentIds = new Set(removedBindings.map((binding) => binding.segment_id).filter(Boolean));
+  data.script.bindings = (data.script.bindings || []).filter((binding) => !deletableShotIds.has(String(binding.shot_id || "")));
+  const remainingSegmentIds = new Set((data.script.bindings || []).map((binding) => binding.segment_id).filter(Boolean));
+  data.script.segments = (data.script.segments || []).filter((segment) => !removedSegmentIds.has(segment.segment_id) || remainingSegmentIds.has(segment.segment_id));
+
+  saveProjectPart(projectId, "canvas.json", data.canvas);
+  saveProjectPart(projectId, "jobs.json", data.jobs);
+  saveProjectPart(projectId, "shots.json", data.shots);
+  saveProjectPart(projectId, "tags.json", data.tags);
+  saveProjectPart(projectId, "prompt_context.json", data.prompt_context);
+  saveProjectPart(projectId, "script.json", data.script);
+  return {
+    data,
+    counts: {
+      shots: deletableShotIds.size,
+      nodes: removedNodes.length,
+      jobs: relatedJobs.length,
+      assets: removableAssetIds.size,
+    },
+  };
+}
+
 function restoreArchive(projectId, archiveId = "") {
   const data = loadProject(projectId);
   const archive = (data.archives || []).find((item) => item.archive_id === archiveId);
@@ -3117,9 +3436,18 @@ async function resumeQueuedContinuousJobs(projectId) {
       changed = true;
     }
     if (job.status !== "queued" && job.status !== "rate_limited") continue;
+    if (job.platform === "jimeng_cli" && !isJimengVipModel(job.parameters?.model)) {
+      const nextModel = chooseJimengQueueModel(data.jobs, job);
+      if (nextModel && nextModel !== job.parameters?.model) {
+        job.parameters = { ...(job.parameters || {}), model: nextModel };
+        job.failure_reason = `即梦 ${nextModel} 通道空闲，已自动切换普通模型待提交。`;
+        job.updated_at = now();
+        changed = true;
+      }
+    }
     if (!canStartQueuedJob(data.jobs, job)) {
       const waitingReason = job.platform === "jimeng_cli"
-        ? "即梦当前还有任务在生成，等结果返回后自动提交。"
+        ? "即梦当前同模型通道还有任务在生成，等结果返回后自动提交；seedance2.0 与 seedance2.0fast 会自动轮换。"
         : "待提交：Lovart 按单通道提交，等前一条拿到平台返回后自动提交。";
       if (job.failure_reason !== waitingReason) {
         job.failure_reason = waitingReason;
@@ -3474,8 +3802,16 @@ async function processLovartJobSubmission(projectId, jobId) {
   if (result.jimeng_submit_id) storedJob.jimeng_submit_id = result.jimeng_submit_id;
   if (job.submitted_prompt) storedJob.submitted_prompt = job.submitted_prompt;
   if (job.submitted_command) storedJob.submitted_command = job.submitted_command;
+  if (job.submitted_at) storedJob.submitted_at = job.submitted_at;
   if (!result.ok) {
     const status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.status || (result.pending ? "running" : "failed"));
+    if (canAutoRetryJimengJob(storedJob, result.reason) && status === "failed") {
+      queueJimengAutoRetry(storedJob, result.reason);
+      updateAssetLibraryAfterJob(projectId, storedJob, { status: "queued", failure_reason: storedJob.failure_reason || "" });
+      saveProjectPart(projectId, "jobs.json", fresh.jobs);
+      void resumeQueuedContinuousJobs(projectId).catch(() => {});
+      return;
+    }
     storedJob.status = status;
     storedJob.failure_reason = status === "running" ? "" : result.reason;
     if (result.pending_confirmation) storedJob.pending_confirmation = result.pending_confirmation;
@@ -3663,6 +3999,26 @@ async function handleApi(req, res) {
       });
     } catch (error) {
       return send(res, 400, { ok: false, error: error.message || "归档失败。" });
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/shots/delete") {
+    const body = await readBody(req);
+    try {
+      const { data, counts } = deleteShotsFromProject(body.project_id, Array.isArray(body.shot_ids) ? body.shot_ids : []);
+      return send(res, 200, {
+        ok: true,
+        counts,
+        canvas: data.canvas,
+        shots: data.shots,
+        tags: data.tags,
+        jobs: data.jobs,
+        archives: data.archives,
+        prompt_context: data.prompt_context,
+        script: data.script,
+      });
+    } catch (error) {
+      return send(res, 400, { ok: false, error: error.message || "删除分镜失败。" });
     }
   }
 
@@ -4204,7 +4560,37 @@ async function handleApi(req, res) {
     const fresh = loadProject(body.project_id);
     const storedJob = fresh.jobs.find((item) => item.job_id === body.job_id);
     if (!result.ok) {
+      if (result.pending) {
+        storedJob.status = result.status === "pending_confirmation" ? "running" : (result.status || "running");
+        storedJob.failure_reason = "";
+        storedJob.updated_at = now();
+        updateAssetLibraryAfterJob(body.project_id, storedJob, { status: "running", failure_reason: "" });
+        saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
+        return send(res, 200, {
+          ok: true,
+          pending: true,
+          job: storedJob,
+          message: result.reason || "平台仍在生成中。",
+          canvas: fresh.canvas,
+          asset_library: loadProject(body.project_id).asset_library,
+        });
+      }
       storedJob.status = isConcurrentLimit(result.reason) ? "rate_limited" : (result.status || (result.pending ? "running" : "failed"));
+      if (canAutoRetryJimengJob(storedJob, result.reason) && storedJob.status === "failed") {
+        queueJimengAutoRetry(storedJob, result.reason);
+        updateAssetLibraryAfterJob(body.project_id, storedJob, { status: "queued", failure_reason: storedJob.failure_reason || "" });
+        saveProjectPart(body.project_id, "jobs.json", fresh.jobs);
+        void resumeQueuedContinuousJobs(body.project_id).catch(() => {});
+        return send(res, 200, {
+          ok: true,
+          pending: true,
+          auto_retry: true,
+          job: storedJob,
+          message: storedJob.failure_reason,
+          canvas: fresh.canvas,
+          asset_library: loadProject(body.project_id).asset_library,
+        });
+      }
       storedJob.failure_reason = result.reason;
       storedJob.updated_at = now();
       updateAssetLibraryAfterJob(body.project_id, storedJob, { status: storedJob.status === "running" ? "running" : "failed", failure_reason: result.reason || "" });
@@ -4236,6 +4622,20 @@ async function handleApi(req, res) {
       void resumeQueuedContinuousJobs(body.project_id).catch(() => {});
     }
     return send(res, 200, { ok: true, job: storedJob, assets: cleanAssets, canvas: fresh.canvas, asset_library: loadProject(body.project_id).asset_library });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/jobs/delete") {
+    const body = await readBody(req);
+    const result = deleteQueuedJobFromProject(body.project_id, body.job_id);
+    if (!result.ok) return send(res, result.status || 400, { ok: false, error: result.error || "删除任务失败。" });
+    return send(res, 200, result);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/jobs/requeue-failed") {
+    const body = await readBody(req);
+    const result = requeueFailedJobFromProject(body.project_id, body.job_id);
+    if (!result.ok) return send(res, result.status || 400, { ok: false, error: result.error || "重新提交失败。" });
+    return send(res, 200, result);
   }
 
   if (req.method === "POST" && url.pathname === "/api/jobs/confirm") {
@@ -4425,20 +4825,27 @@ module.exports = {
   assetTemplateOutputName,
   blockingJobs,
   buildReferencePromptText,
+  buildJimengReferencePrompt,
   buildTags,
   canStartQueuedJob,
   cleanGeneratedAssets,
   connectImageResultsToShotVideo,
   createProject,
   defaultPromptFeedbackPresets,
+  deleteShotsFromProject,
+  deleteQueuedJobFromProject,
   deepSeekHttpErrorMessage,
   extractJsonObject,
   ensureJimengLocalAsset,
   exportProjectReusePackage,
   importProjectReusePackage,
+  canAutoRetryJimengJob,
+  isJimengFinalGenerationFailure,
   isJimengVipModel,
+  jimengQueryTimeoutPendingReason,
   jobBlocksSubmission,
   loadProject,
+  mergeCanvasForSave,
   normalizeDeepSeekBaseUrl,
   normalizePromptOptimization,
   placeResultNodes,
@@ -4449,6 +4856,7 @@ module.exports = {
   pruneDormantJobsForTarget,
   rateLimitHandledReason,
   recordProcessedDownloads,
+  requeueFailedJobFromProject,
   safeName,
   uniquePath,
 };

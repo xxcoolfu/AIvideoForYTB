@@ -15,6 +15,7 @@ const state = {
   openTagIds: [],
   openShotIds: [],
   openShotParamIds: [],
+  selectedShotIds: [],
   openJobIds: [],
   openJobSubdetailIds: [],
   selectedEdgeId: null,
@@ -223,11 +224,13 @@ function mergeCanvasDraftWithServer(draftCanvas = {}, serverCanvas = {}) {
   });
   next.nodes.push(...preservedNodes);
   preservedNodes.forEach((node) => nextNodeIds.add(node.id));
+  const preservedNodeIds = new Set(preservedNodes.map((node) => node.id).filter(Boolean));
   const edgeKey = (edge) => `${edge.source || ""}->${edge.target || ""}`;
   const nextEdgeKeys = new Set(next.edges.map(edgeKey));
   for (const edge of serverCanvas.edges || []) {
     if (!edge.source || !edge.target) continue;
     if (!nextNodeIds.has(edge.source) || !nextNodeIds.has(edge.target)) continue;
+    if (!preservedNodeIds.has(edge.source) && !preservedNodeIds.has(edge.target)) continue;
     const key = edgeKey(edge);
     if (nextEdgeKeys.has(key)) continue;
     next.edges.push(edge);
@@ -681,6 +684,15 @@ function isJimengVipModel(model) {
   return /_vip$/i.test(String(model || "").trim());
 }
 
+function jimengConcurrencyModel(model) {
+  return String(model || "").trim().toLowerCase();
+}
+
+function isJimengRotatableSeedanceModel(model) {
+  const normalized = jimengConcurrencyModel(model);
+  return normalized === "seedance2.0fast" || normalized === "seedance2.0";
+}
+
 function activeJobsForPlatform(platform = "lovart") {
   const normalizedPlatform = normalizePlatform(platform);
   return state.jobs.filter((job) => {
@@ -690,6 +702,13 @@ function activeJobsForPlatform(platform = "lovart") {
   });
 }
 
+function activeJimengJobsForModel(model) {
+  const normalizedModel = jimengConcurrencyModel(model);
+  return activeJobsForPlatform("jimeng_cli").filter((job) => (
+    normalizedModel && jimengConcurrencyModel(job.parameters?.model) === normalizedModel
+  ));
+}
+
 function jobBlocksNodeSubmission(job = {}, node = null) {
   if (job.status !== "rate_limited" || job.rate_limit_handled) return false;
   const params = generatorParameters(node?.data || {});
@@ -697,7 +716,10 @@ function jobBlocksNodeSubmission(job = {}, node = null) {
   const nodePlatform = normalizePlatform(params.platform || "lovart");
   if (jobPlatform !== nodePlatform) return false;
   if (nodePlatform === "jimeng_cli" && isJimengVipModel(params.model)) return false;
-  if (nodePlatform === "jimeng_cli") return activeJobsForPlatform(nodePlatform).length > 0;
+  if (nodePlatform === "jimeng_cli") {
+    if (isJimengRotatableSeedanceModel(params.model)) return activeJimengJobsForModel(params.model).length > 0;
+    return activeJobsForPlatform(nodePlatform).length > 0;
+  }
   return true;
 }
 
@@ -1068,10 +1090,53 @@ function isEditingElement(target = document.activeElement) {
   return false;
 }
 
-function addAssetNode(asset) {
-  const type = asset.kind === "image" || asset.kind === "video" || asset.kind === "audio" ? asset.kind : "image";
-  addNode(type, { title: asset.name, asset_id: asset.asset_id });
-  return selectedNode();
+function assetNodeType(asset = {}) {
+  return asset.kind === "image" || asset.kind === "video" || asset.kind === "audio" ? asset.kind : "image";
+}
+
+function addAssetNode(asset, position = null, options = {}) {
+  if (!asset) return null;
+  const type = assetNodeType(asset);
+  return addNode(type, { title: asset.name, asset_id: asset.asset_id }, position, options);
+}
+
+function visibleAssetList() {
+  return state.canvas.assets.filter((asset) => asset.is_library_asset || !["image", "video"].includes(asset.kind));
+}
+
+function layoutAllVisibleAssets() {
+  const visibleAssets = visibleAssetList();
+  if (!visibleAssets.length) {
+    setStatus("当前没有可布置的素材资产。", "bad");
+    return;
+  }
+  const existingAssetIds = new Set(state.canvas.nodes.map((node) => node.data?.asset_id).filter(Boolean));
+  const missingAssets = visibleAssets.filter((asset) => !existingAssetIds.has(asset.asset_id));
+  if (!missingAssets.length) {
+    setStatus("素材资产已经都在画布上了。", "ok");
+    return;
+  }
+  const wasEmpty = !state.canvas.nodes.length;
+  const bounds = canvasNodeBounds();
+  const columns = Math.min(4, Math.max(1, Math.ceil(Math.sqrt(missingAssets.length))));
+  const gapX = NODE_WIDTH + 72;
+  const gapY = NODE_HEIGHT + 72;
+  const startX = wasEmpty
+    ? bounds.minX - ((columns - 1) * gapX) / 2
+    : bounds.maxX + 120;
+  const startY = wasEmpty
+    ? bounds.minY - NODE_HEIGHT / 2
+    : bounds.minY;
+  const createdNodes = missingAssets.map((asset, index) => addAssetNode(asset, {
+    x: startX + (index % columns) * gapX,
+    y: startY + Math.floor(index / columns) * gapY,
+  }, { render: false }));
+  state.selectedNodeIds = createdNodes.map((node) => node?.id).filter(Boolean);
+  state.selectedNodeId = state.selectedNodeIds.at(-1) || null;
+  syncSelectionState();
+  render();
+  fitToNodes({ silent: true });
+  setStatus(`已布置 ${createdNodes.length} 个素材资产，已在画布上的自动跳过。`, "ok");
 }
 
 function selectedNode() {
@@ -1085,14 +1150,11 @@ function assetById(assetId) {
 function tagsFromText(text) {
   const source = String(text || "");
   const refs = new Set();
-  for (const match of source.matchAll(/^\s*@([^@\n]{1,120}?)\s+[—–-]\s+/gmu)) {
-    const label = String(match[1] || "").replace(/\s+/g, " ").trim();
-    if (label) refs.add(`@${label}`);
-  }
-  for (const token of source.match(/@(?:[A-Za-z][A-Za-z0-9_\-·]*|[\p{Script=Han}\p{N}_\-·]+)/gu) || []) {
-    const label = token.trim();
-    const isShortPrefix = Array.from(refs).some((fullLabel) => fullLabel !== label && fullLabel.startsWith(`${label} `));
-    if (!isShortPrefix) refs.add(label);
+  for (const line of source.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("@")) continue;
+    const body = trimmed.slice(1).replace(/\s+/g, " ").trim();
+    if (body) refs.add(`@${body}`);
   }
   return Array.from(refs);
 }
@@ -1116,6 +1178,10 @@ function promptContainsAlias(text, alias) {
   if (!cleanAlias) return false;
   const source = String(text || "");
   return explicitTagAliasRegex(cleanAlias).test(source) || aliasMatchRegex(cleanAlias).test(source);
+}
+
+function exactTagBindingName(text) {
+  return String(text || "").trim().replace(/^@/, "").trim();
 }
 
 function tagRefsForPrompt(prompt, tags = state.tags) {
@@ -1178,6 +1244,8 @@ function mapImportedVideoModel(rawModel, preferredSeedancePlatform = "lovart") {
     "seedance2.0fast": { lovart: "generate_video_seedance_v2_0_fast", jimeng_cli: "seedance2.0fast" },
     "seedance2.0_vip": { lovart: "generate_video_seedance_v2_0", jimeng_cli: "seedance2.0_vip" },
     "seedance2.0fast_vip": { lovart: "generate_video_seedance_v2_0_fast", jimeng_cli: "seedance2.0fast_vip" },
+    "generate_video_seedance_v2_0": { lovart: "generate_video_seedance_v2_0", jimeng_cli: "seedance2.0" },
+    "generate_video_seedance_v2_0_fast": { lovart: "generate_video_seedance_v2_0_fast", jimeng_cli: "seedance2.0fast" },
   };
   if (seedanceMap[lower]) return seedanceMap[lower][seedancePlatform];
   const klingMap = {
@@ -1221,7 +1289,7 @@ function shotNeedsSeedanceChoice(shot = {}) {
 function applySeedancePlatformToImportedShots(shots = [], preferredSeedancePlatform = "lovart") {
   return shots.map((shot) => {
     const normalized = normalizeShotPlatformAndModel(
-      shot.platform,
+      shotNeedsSeedanceChoice(shot) ? "" : shot.platform,
       String(shot.video_model || "").trim(),
       shot.transition,
       preferredSeedancePlatform
@@ -1464,10 +1532,16 @@ function assetDisplayName(asset) {
   return `${asset.name}${asset.asset_category ? ` · ${asset.asset_category}` : ""}`;
 }
 
+function assetNodeDisplayName(assetId) {
+  const node = state.canvas.nodes.find((item) => item.data?.asset_id === assetId && String(item.data?.title || "").trim());
+  return String(node?.data?.title || assetById(assetId)?.name || "").trim();
+}
+
 function referenceRoleLabel(role) {
   return {
     auto: "自动判断",
     first_frame: "首帧参考",
+    tail_frame: "尾帧参考",
     character_reference: "角色参考",
     scene_reference: "场景参考",
     prop_reference: "道具参考",
@@ -1501,6 +1575,22 @@ function jimengReferenceName(item = {}) {
     .trim();
 }
 
+function jimengReferenceFallbackName(item = {}, mediaLabel = "参考素材") {
+  const roleLabel = referenceRoleLabel(item.reference_role || "reference");
+  return String(item.primary_tag_label || item.asset_name || item.asset?.name || roleLabel || item.asset_id || mediaLabel || "参考素材")
+    .replace(/^@/, "")
+    .trim();
+}
+
+function jimengReferenceLine(mediaLabel, item = {}) {
+  const roleLabel = referenceRoleLabel(item.reference_role || "reference");
+  if (item.reference_role === "first_frame" && !String(item.primary_tag_label || "").trim()) {
+    return `@${mediaLabel}=首帧参考`;
+  }
+  const name = jimengReferenceName(item) || jimengReferenceFallbackName(item, mediaLabel);
+  return name === roleLabel ? `@${mediaLabel}=${roleLabel}` : `@${mediaLabel}=${name}（${roleLabel}）`;
+}
+
 function buildJimengReferencePrompt(items = [], mode = "") {
   if (!items.length) return "";
   const imageLines = [];
@@ -1510,17 +1600,15 @@ function buildJimengReferencePrompt(items = [], mode = "") {
   let videoIndex = 0;
   let audioIndex = 0;
   for (const item of items) {
-    const name = jimengReferenceName(item);
-    if (!name) continue;
     if (item.asset?.kind === "image") {
       imageIndex += 1;
-      imageLines.push(`@图片${imageIndex}=${name}`);
+      imageLines.push(jimengReferenceLine(`图片${imageIndex}`, item));
     } else if (item.asset?.kind === "video") {
       videoIndex += 1;
-      videoLines.push(`@视频${videoIndex}=${name}`);
+      videoLines.push(jimengReferenceLine(`视频${videoIndex}`, item));
     } else if (item.asset?.kind === "audio") {
       audioIndex += 1;
-      audioLines.push(`@音频${audioIndex}=${name}`);
+      audioLines.push(jimengReferenceLine(`音频${audioIndex}`, item));
     }
   }
   const lines = [...imageLines, ...videoLines, ...audioLines];
@@ -1705,6 +1793,17 @@ function focusNode(node) {
   render();
 }
 
+function focusReviewNode(nodeId) {
+  const node = state.canvas.nodes.find((item) => item.id === nodeId);
+  if (!node) {
+    setStatus("这个备忘录不在当前画布上，可能已经归档。先恢复归档再定位。", "bad");
+    return;
+  }
+  state.rightTab = "inspector";
+  focusNode(node);
+  setStatus(`已定位到：${nodeTitle(node)}。`, "ok");
+}
+
 function collectSubmissionInputs(nodeId) {
   const incoming = state.canvas.edges.filter((edge) => edge.target === nodeId);
   const promptParts = [];
@@ -1766,7 +1865,7 @@ function buildSubmissionPreview(node) {
       ...input,
       order: index + 1,
       asset,
-      asset_name: asset.name,
+      asset_name: String(input.source_node_title || asset.name || input.asset_id).trim(),
       tag_labels: tagLabels,
       primary_tag_label: tagLabels[0] || "",
       reference_role: inferReferenceRoleForNode(node, input, asset, explicitRole),
@@ -1801,6 +1900,9 @@ function buildSubmissionPreview(node) {
               : [
                   params.feature === "first_frame" || assets.some((item) => item.reference_role === "first_frame")
                     ? "请严格使用被标记为“首帧参考”的附件作为起始画面。"
+                    : "",
+                  assets.some((item) => item.reference_role === "tail_frame")
+                    ? "被标记为“尾帧参考”的附件只用于理解目标结束画面或上一镜尾帧，不要当成首帧。"
                     : "",
                   "角色参考只用于角色一致性，场景参考只用于空间与布光，道具参考只用于物体细节。",
                   "不要混淆各附件编号、图片编号和用途；若模型无法遵守，请直接说明具体原因。",
@@ -1847,6 +1949,7 @@ function renderReferenceAssetFields(node) {
               ${[
                 ["auto", "自动判断"],
                 ["first_frame", "首帧参考"],
+                ["tail_frame", "尾帧参考"],
                 ["character_reference", "角色参考"],
                 ["scene_reference", "场景参考"],
                 ["prop_reference", "道具参考"],
@@ -1960,19 +2063,20 @@ function ensureAssetNode(assetId, position) {
 function upsertShotGeneratorNode(type, shot, role, position, prompt, parameters, title, workflow = workflowPreset()) {
   const existing = findShotNode(shot.shot_id, role);
   const normalizedExisting = normalizeGeneratorData(existing?.data || {});
-  const split = splitParametersByPlatform(normalizePlatform(shot.platform), parameters);
+  const shotPlatform = normalizePlatform(shot.platform);
+  const split = splitParametersByPlatform(shotPlatform, parameters);
   const data = {
     ...(existing?.data || {}),
     title,
     prompt,
-    platform: normalizePlatform(shot.platform),
-    common_parameters: { ...split.common, ...(normalizedExisting.common_parameters || {}) },
+    platform: shotPlatform,
+    common_parameters: { ...(normalizedExisting.common_parameters || {}), ...split.common },
     platform_parameters: {
-      ...split.platformSpecific,
       ...(normalizedExisting.platform_parameters || {}),
-      [normalizePlatform(shot.platform)]: {
-        ...(split.platformSpecific[normalizePlatform(shot.platform)] || {}),
-        ...(normalizedExisting.platform_parameters?.[normalizePlatform(shot.platform)] || {}),
+      ...split.platformSpecific,
+      [shotPlatform]: {
+        ...(normalizedExisting.platform_parameters?.[shotPlatform] || {}),
+        ...(split.platformSpecific[shotPlatform] || {}),
       },
     },
     shot_id: shot.shot_id,
@@ -2129,6 +2233,173 @@ async function archiveSelectedNodes() {
   render();
   const archive = result.archive || {};
   setStatus(`已归档：${archive.title || "选中内容"}。当前画布已移出 ${archive.counts?.nodes || 0} 个节点。`, "ok");
+}
+
+function selectedShotIds() {
+  const existing = new Set(state.shots.map((shot) => String(shot.shot_id || "")));
+  state.selectedShotIds = (state.selectedShotIds || []).filter((shotId) => existing.has(String(shotId)));
+  return [...state.selectedShotIds];
+}
+
+function setShotSelected(shotId, selected) {
+  const id = String(shotId || "");
+  if (!id) return;
+  const ids = new Set(selectedShotIds());
+  if (selected) ids.add(id);
+  else ids.delete(id);
+  state.selectedShotIds = Array.from(ids);
+}
+
+function clearShotSelection() {
+  state.selectedShotIds = [];
+}
+
+function updateShotBulkActions() {
+  const selectedCount = selectedShotIds().length;
+  const toggleButton = $("#toggleAllShots");
+  const deleteButton = $("#deleteSelectedShots");
+  const applyButton = $("#applyBulkShotParams");
+  const workflowButton = $("#applyDefaultWorkflow");
+  const ungeneratedWorkflowButton = $("#applyUngeneratedWorkflow");
+  const bulkInputs = ["#bulkShotPlatform", "#bulkShotSize", "#bulkShotVideoModel"]
+    .map((selector) => $(selector))
+    .filter(Boolean);
+  if (toggleButton) toggleButton.textContent = selectedCount === state.shots.length ? "取消全选" : "全选分镜";
+  if (deleteButton) {
+    deleteButton.disabled = !selectedCount;
+    deleteButton.textContent = selectedCount ? `删除 ${selectedCount} 条` : "删除分镜";
+  }
+  if (applyButton) {
+    applyButton.disabled = !selectedCount;
+    applyButton.textContent = selectedCount ? `应用到 ${selectedCount} 条` : "应用批量参数";
+  }
+  bulkInputs.forEach((input) => {
+    input.disabled = !selectedCount;
+  });
+  if (workflowButton) {
+    workflowButton.textContent = selectedCount ? `应用选中 ${selectedCount} 条分镜` : workflowPreset().applyAllLabel;
+  }
+  if (ungeneratedWorkflowButton) {
+    const ungeneratedCount = ungeneratedShotIndexes().length;
+    ungeneratedWorkflowButton.disabled = !ungeneratedCount;
+    ungeneratedWorkflowButton.textContent = `应用未生成工作流分镜${ungeneratedCount ? `（${ungeneratedCount}）` : ""}`;
+  }
+}
+
+async function deleteSelectedShots() {
+  const ids = selectedShotIds();
+  if (!ids.length) {
+    setStatus("先勾选要删除的分镜。", "bad");
+    return;
+  }
+  const ok = window.confirm(`删除会把 ${ids.length} 条分镜从当前项目移除，并清理关联画布节点和任务记录。本地生成文件不会删除。`);
+  if (!ok) return;
+  try {
+    await saveCanvas({ silent: true });
+    const result = await api("/api/shots/delete", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, shot_ids: ids }),
+    });
+    applyProjectStatePayload(result);
+    clearShotSelection();
+    clearNodeSelection();
+    clearConnectSources();
+    state.selectedEdgeId = null;
+    state.canvasDirty = false;
+    clearCanvasDraft();
+    render();
+    const counts = result.counts || {};
+    setStatus(`已删除 ${counts.shots || ids.length} 条分镜，清理 ${counts.nodes || 0} 个画布节点、${counts.jobs || 0} 条任务记录。`, "ok");
+  } catch (error) {
+    const message = /Unknown API|404/.test(String(error?.message || ""))
+      ? "删除分镜失败：本地服务还没加载新接口，请重启画布后再试。"
+      : `删除分镜失败：${error.message}`;
+    setStatus(message, "bad");
+  }
+}
+
+function availableShotVideoModels() {
+  return Array.from(new Set([
+    ...(state.params?.video?.models || []).filter((model) => model && model !== "agent-auto"),
+    ...Object.values(JIMENG_VIDEO_MODELS).flat(),
+  ]));
+}
+
+function shotAspectRatioChoices() {
+  return Array.from(new Set([
+    "21:9",
+    "16:9",
+    "3:2",
+    "4:3",
+    "1:1",
+    "3:4",
+    "2:3",
+    "9:16",
+  ]));
+}
+
+function applyShotNormalization(shot) {
+  const normalized = normalizeShotPlatformAndModel(
+    shot.platform,
+    String(shot.video_model || "").trim(),
+    shot.transition,
+    getPreferredSeedancePlatform()
+  );
+  shot.platform = normalized.platform;
+  shot.video_model = normalized.video_model;
+  const prompt = [shot.image_prompt, shot.video_prompt].filter(Boolean).join("\n\n");
+  shot.prompt = prompt;
+  shot.tag_refs = tagRefsForPrompt(prompt);
+  return shot;
+}
+
+async function applyBulkShotParams() {
+  const ids = new Set(selectedShotIds());
+  if (!ids.size) {
+    setStatus("先勾选要批量调整的分镜。", "bad");
+    return;
+  }
+  const platform = $("#bulkShotPlatform")?.value || "";
+  const size = $("#bulkShotSize")?.value || "";
+  const model = $("#bulkShotVideoModel")?.value || "";
+  const changes = {};
+  if (platform) changes.platform = platform;
+  if (size) changes.size = size;
+  if (model) changes.video_model = model;
+  if (!Object.keys(changes).length) {
+    setStatus("先选择要批量调整的平台、画幅或模型。", "bad");
+    return;
+  }
+
+  let changed = 0;
+  state.shots = state.shots.map((shot) => {
+    if (!ids.has(String(shot.shot_id || ""))) return shot;
+    changed += 1;
+    return applyShotNormalization({ ...shot, ...changes });
+  });
+  await saveShotsAndTagsFromTable({ silent: true });
+  renderShotTable();
+  renderInspector();
+  setStatus(`已批量调整 ${changed} 条分镜。`, "ok");
+}
+
+function selectedShotIndexes() {
+  const ids = new Set(selectedShotIds());
+  return state.shots
+    .map((shot, index) => ids.has(String(shot.shot_id || "")) ? index : -1)
+    .filter((index) => index >= 0);
+}
+
+function shotHasWorkflowNodes(shot) {
+  const shotId = String(shot?.shot_id || "");
+  if (!shotId) return false;
+  return Boolean(findShotNode(shotId, "image") || findShotNode(shotId, "video"));
+}
+
+function ungeneratedShotIndexes() {
+  return state.shots
+    .map((shot, index) => shotHasWorkflowNodes(shot) ? -1 : index)
+    .filter((index) => index >= 0);
 }
 
 async function restoreArchive(archiveId) {
@@ -2815,10 +3086,10 @@ function renderTags() {
     <div class="tag-summary">
       <span>标签 ${sortedTags.length}</span>
       <span class="${unboundCount ? "bad" : "ok"}">${unboundCount ? `待绑定 ${unboundCount}` : "已全部绑定"}</span>
-      <button id="autoBindTagsByName" ${unboundCount ? "" : "disabled"}>自动绑定同名资产</button>
+      <button id="autoBindTagsByName" ${unboundCount ? "" : "disabled"}>自动绑定同名节点</button>
     </div>
   ` + sortedTags.map((tag) => {
-    const boundNames = (tag.bound_asset_ids || []).map((id) => assetById(id)?.name).filter(Boolean);
+    const boundNames = (tag.bound_asset_ids || []).map((id) => assetNodeDisplayName(id)).filter(Boolean);
     const hasBindings = boundNames.length > 0;
     return `
       <details class="tag-card" data-tag-detail="${escapeHtml(tag.tag_id)}" ${(!hasBindings || state.openTagIds.includes(tag.tag_id)) ? "open" : ""}>
@@ -2834,6 +3105,7 @@ function renderTags() {
         <div class="tag-card-actions">
           <button data-open-tag-picker="${tag.tag_id}">${hasBindings ? "重选资产" : "去绑定资产"}</button>
           <button data-normalize-tag="${tag.tag_id}">统一名字</button>
+          ${hasBindings ? "" : `<button class="danger" data-delete-tag="${tag.tag_id}">删除标签</button>`}
         </div>
         <label class="field compact">
           <span>别名（逗号分隔）</span>
@@ -2865,18 +3137,61 @@ function renderTags() {
   box.querySelectorAll("[data-normalize-tag]").forEach((button) => {
     button.addEventListener("click", () => normalizeTagAcrossShots(button.dataset.normalizeTag));
   });
+  box.querySelectorAll("[data-delete-tag]").forEach((button) => {
+    button.addEventListener("click", () => deleteUnboundTag(button.dataset.deleteTag).catch((error) => {
+      setStatus(`删除标签失败：${error.message}`, "bad");
+    }));
+  });
   $("#autoBindTagsByName")?.addEventListener("click", () => autoBindTagsByExactAssetName().catch((error) => {
     setStatus(`自动绑定失败：${error.message}`, "bad");
   }));
 }
 
+function removeTagDeclarationLines(text, label) {
+  const target = exactTagBindingName(label);
+  return String(text || "")
+    .split(/\r?\n/)
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("@")) return true;
+      return exactTagBindingName(trimmed) !== target;
+    })
+    .join("\n")
+    .trim();
+}
+
+async function deleteUnboundTag(tagId) {
+  const tag = state.tags.find((item) => item.tag_id === tagId);
+  if (!tag) return;
+  if ((tag.bound_asset_ids || []).length) {
+    setStatus("这个标签已经绑定资产，先解绑后才能删除。", "bad");
+    return;
+  }
+  const ok = window.confirm(`删除 ${tag.label}？会从分镜提示词里移除对应的 @资产声明行。`);
+  if (!ok) return;
+  for (const shot of state.shots) {
+    shot.image_prompt = removeTagDeclarationLines(shot.image_prompt || "", tag.label);
+    shot.video_prompt = removeTagDeclarationLines(shot.video_prompt || "", tag.label);
+    shot.prompt = [shot.image_prompt, shot.video_prompt].filter(Boolean).join("\n\n");
+    shot.tag_refs = (shot.tag_refs || []).filter((label) => label !== tag.label);
+  }
+  state.tags = state.tags.filter((item) => item.tag_id !== tagId);
+  await saveShotsAndTagsFromTable({ silent: true });
+  state.openTagIds = state.openTagIds.filter((id) => id !== tagId);
+  setStatus(`已删除标签 ${tag.label}。`, "ok");
+}
+
 async function autoBindTagsByExactAssetName() {
   const assetsByName = new Map();
-  for (const asset of libraryAssets()) {
-    const name = String(asset.name || "").trim();
+  const libraryAssetIds = new Set(libraryAssets().map((asset) => asset.asset_id));
+  for (const node of state.canvas.nodes || []) {
+    const assetId = node.data?.asset_id;
+    if (!assetId || !libraryAssetIds.has(assetId)) continue;
+    const name = exactTagBindingName(node.data?.title);
     if (!name) continue;
     const list = assetsByName.get(name) || [];
-    list.push(asset);
+    const asset = assetById(assetId);
+    if (asset && !list.some((item) => item.asset_id === asset.asset_id)) list.push(asset);
     assetsByName.set(name, list);
   }
 
@@ -2885,19 +3200,20 @@ async function autoBindTagsByExactAssetName() {
   const missing = [];
   const nextTags = state.tags.map((tag) => {
     if ((tag.bound_asset_ids || []).length) return tag;
-    const label = String(tag.label || "").trim();
+    const displayLabel = String(tag.label || "").trim();
+    const label = exactTagBindingName(tag.label);
     const matches = assetsByName.get(label) || [];
     if (matches.length === 1) {
       changedCount += 1;
       return { ...tag, bound_asset_ids: [matches[0].asset_id] };
     }
-    if (matches.length > 1) conflicts.push({ label, count: matches.length });
-    else missing.push(label);
+    if (matches.length > 1) conflicts.push({ label: displayLabel || label, count: matches.length });
+    else missing.push(displayLabel || label);
     return tag;
   });
 
   if (!changedCount && !conflicts.length) {
-    setStatus(missing.length ? "没有找到名称完全相同的未绑定资产。" : "当前没有需要自动绑定的标签。", "bad");
+    setStatus(missing.length ? "没有找到节点名称完全相同的未绑定资产。" : "当前没有需要自动绑定的标签。", "bad");
     return;
   }
 
@@ -2914,12 +3230,12 @@ async function autoBindTagsByExactAssetName() {
   renderInspector();
 
   if (conflicts.length) {
-    const detail = conflicts.map((item) => `${item.label}（${item.count} 个同名资产）`).join("\n");
-    alert(`这些标签找到多个同名资产，已跳过，请手动选择：\n${detail}`);
+    const detail = conflicts.map((item) => `${item.label}（${item.count} 个同名节点）`).join("\n");
+    alert(`这些标签找到多个同名节点，已跳过，请手动选择：\n${detail}`);
   }
-  const conflictText = conflicts.length ? `；${conflicts.length} 个标签有多个同名资产，已跳过` : "";
+  const conflictText = conflicts.length ? `；${conflicts.length} 个标签有多个同名节点，已跳过` : "";
   const statusKind = conflicts.length && !changedCount ? "bad" : "ok";
-  setStatus(changedCount ? `已自动绑定 ${changedCount} 个标签${conflictText}。` : `没有自动绑定；${conflicts.length} 个标签有多个同名资产，已跳过。`, statusKind);
+  setStatus(changedCount ? `已按节点名称自动绑定 ${changedCount} 个标签${conflictText}。` : `没有自动绑定；${conflicts.length} 个标签有多个同名节点，已跳过。`, statusKind);
 }
 
 function renderTagPickerPreview(asset) {
@@ -2999,6 +3315,239 @@ function downloadJsonFile(fileName, data) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+function downloadTextFile(fileName, text, type = "text/markdown;charset=utf-8") {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function safeDownloadName(name) {
+  return String(name || "AI视频项目").replace(/[\\/:*?"<>|]/g, "_").trim() || "AI视频项目";
+}
+
+function markdownCell(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return " ";
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\|/g, "\\|")
+    .replace(/\n+/g, "<br>");
+}
+
+function markdownTable(headers, rows) {
+  const head = `| ${headers.map(markdownCell).join(" | ")} |`;
+  const divider = `| ${headers.map(() => "---").join(" | ")} |`;
+  const body = rows.length
+    ? rows.map((row) => `| ${headers.map((header) => markdownCell(row[header])).join(" | ")} |`).join("\n")
+    : `| ${headers.map(() => " ").join(" | ")} |`;
+  return `${head}\n${divider}\n${body}`;
+}
+
+function assetAddress(asset) {
+  if (!asset) return "";
+  return asset.file_path || asset.url || asset.external_url || asset.source_url || "";
+}
+
+function isMediaAsset(asset) {
+  return asset?.kind === "image" || asset?.kind === "video";
+}
+
+function mediaAddressForNode(node, assets = state.canvas.assets) {
+  const assetId = node?.data?.asset_id;
+  const asset = assetId ? assets.find((item) => item.asset_id === assetId) : null;
+  if (!isMediaAsset(asset)) return "";
+  return assetAddress(asset);
+}
+
+function mediaAddressesForNodes(nodes = [], assets = state.canvas.assets) {
+  return nodes.map((node) => mediaAddressForNode(node, assets)).filter(Boolean);
+}
+
+function mediaAddressesForJobs(jobs = [], assets = state.canvas.assets) {
+  const byId = new Map((assets || []).map((asset) => [asset.asset_id, asset]));
+  const addresses = [];
+  for (const job of jobs || []) {
+    for (const assetId of [...(job.input_asset_ids || []), ...(job.output_asset_ids || [])]) {
+      const asset = byId.get(assetId);
+      if (isMediaAsset(asset)) addresses.push(assetAddress(asset));
+    }
+  }
+  return addresses.filter(Boolean);
+}
+
+function archiveAssetAddress(asset) {
+  if (!asset || !["image", "video"].includes(asset.kind)) return "";
+  return assetAddress(asset);
+}
+
+function uniqueTextList(items = []) {
+  const seen = new Set();
+  const result = [];
+  for (const item of items) {
+    const text = String(item || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    result.push(text);
+  }
+  return result;
+}
+
+function nodeShotIdSet(node = {}) {
+  return new Set([
+    node.data?.shot_id,
+    ...(Array.isArray(node.data?.shot_ids) ? node.data.shot_ids : []),
+  ].map((item) => String(item || "").trim()).filter(Boolean));
+}
+
+function jobsLinkedToNode(node, jobs = state.jobs) {
+  const shotIds = nodeShotIdSet(node);
+  return (jobs || []).filter((job) => (
+    job.target_node_id === node.id
+    || (job.shot_id && shotIds.has(String(job.shot_id)))
+    || (Array.isArray(job.shot_ids) && job.shot_ids.some((shotId) => shotIds.has(String(shotId))))
+  ));
+}
+
+function reviewNodePromptBlock(node, jobs = state.jobs) {
+  const pieces = [];
+  const title = `${nodeTitle(node)}（${nodeTypeLabel(node.type)}）`;
+  if (["imageGen", "videoGen"].includes(node.type)) {
+    const parameters = generatorParameters(node.data || {});
+    pieces.push([
+      title,
+      formatGeneratorParameters(parameters) ? `参数：${formatGeneratorParameters(parameters)}` : "",
+      String(node.data?.prompt || "").trim() ? `节点提示词：\n${String(node.data.prompt).trim()}` : "",
+    ].filter(Boolean).join("\n"));
+  } else if (["globalControl", "text"].includes(node.type)) {
+    pieces.push([
+      title,
+      String(node.data?.text || "").trim() ? `文本：\n${String(node.data.text).trim()}` : "",
+    ].filter(Boolean).join("\n"));
+  } else {
+    pieces.push(title);
+  }
+  const submittedPrompts = jobsLinkedToNode(node, jobs)
+    .map((job) => job.submitted_prompt || job.prompt || "")
+    .filter(Boolean);
+  if (submittedPrompts.length) {
+    pieces.push(`实际提交提示词：\n${uniqueTextList(submittedPrompts).join("\n\n")}`);
+  }
+  return uniqueTextList(pieces).join("\n\n");
+}
+
+function reviewPromptBlocksForNodes(nodes = [], jobs = state.jobs) {
+  return uniqueTextList(nodes.map((node) => reviewNodePromptBlock(node, jobs))).join("\n\n---\n\n");
+}
+
+function reviewExportRows() {
+  const rows = [];
+  const memoNodes = state.canvas.nodes.filter((node) => node.type === "memo");
+  for (const memoNode of memoNodes) {
+    const linked = memoLinkedNodes(memoNode);
+    const linkedJobs = linked.flatMap((node) => jobsLinkedToNode(node, state.jobs));
+    rows.push({
+      "来源": nodeTitle(memoNode),
+      "复盘内容": memoHtmlToText(memoNode.data?.html || ""),
+      "关联节点提示词/任务": reviewPromptBlocksForNodes(linked, state.jobs),
+      "图片/视频地址": uniqueTextList([
+        ...mediaAddressesForNodes(linked, state.canvas.assets),
+        ...mediaAddressesForJobs(linkedJobs, state.canvas.assets),
+      ]).join("\n"),
+    });
+  }
+
+  const archives = Array.isArray(state.archives)
+    ? [...state.archives].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+    : [];
+  for (const archive of archives) {
+    const archiveNodes = Array.isArray(archive.nodes) ? archive.nodes : [];
+    const archiveJobs = Array.isArray(archive.jobs) ? archive.jobs : [];
+    const archiveAssets = Array.isArray(archive.assets) ? archive.assets : [];
+    const memos = archiveNodes.filter((node) => node.type === "memo");
+    const rowsForArchive = memos.length ? memos : [null];
+    for (const memo of rowsForArchive) {
+      const linked = memo
+        ? archiveNodes.filter((node) => {
+          if (node.id === memo.id) return false;
+          return (archive.edges || []).some((edge) => (
+            (edge.source === memo.id && edge.target === node.id)
+            || (edge.target === memo.id && edge.source === node.id)
+          ));
+        })
+        : archiveNodes.filter((node) => node.type !== "memo");
+      const sourceParts = [
+        archive.title || "未命名归档",
+        formatTimeLabel(archive.created_at),
+        (archive.shot_ids || []).length ? `分镜 ${(archive.shot_ids || []).join("、")}` : "",
+      ].filter(Boolean);
+      rows.push({
+        "来源": sourceParts.join("\n"),
+        "复盘内容": memo ? memoHtmlToText(memo.data?.html || "") : "",
+        "关联节点提示词/任务": reviewPromptBlocksForNodes(linked, archiveJobs) || uniqueTextList(archiveJobs.map((job) => job.submitted_prompt || job.prompt || "")).join("\n\n"),
+        "图片/视频地址": uniqueTextList([
+          ...mediaAddressesForNodes(linked, archiveAssets),
+          ...mediaAddressesForJobs(archiveJobs, archiveAssets),
+          ...archiveAssets.filter((asset) => asset.source === "generated" || asset.source_job_id).map(archiveAssetAddress),
+        ]).join("\n"),
+      });
+    }
+  }
+
+  const promptRevisions = Array.isArray(state.promptContext?.revisions)
+    ? [...state.promptContext.revisions].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")))
+    : [];
+  for (const revision of promptRevisions) {
+    const fields = Array.isArray(revision.applied_fields) && revision.applied_fields.length
+      ? revision.applied_fields
+      : ["image", "video"].filter((field) => revision[`revised_${field}_prompt`]);
+    rows.push({
+      "来源": [
+        revision.target_label || (revision.shot_id ? `分镜 ${revision.shot_id}` : revision.node_id || "提示词优化"),
+        formatTimeLabel(revision.created_at),
+      ].filter(Boolean).join("\n"),
+      "复盘内容": [
+        revision.feedback ? `修改要求：${revision.feedback}` : "",
+        revision.change_summary ? `修改原因：${revision.change_summary}` : "",
+        ...(Array.isArray(revision.warnings) ? revision.warnings.map((item) => `风险：${item}`) : []),
+      ].filter(Boolean).join("\n"),
+      "关联节点提示词/任务": fields.map((field) => [
+        `原${promptRevisionFieldLabel(field)}：\n${revision[`original_${field}_prompt`] || ""}`,
+        `替换后：\n${revision[`revised_${field}_prompt`] || ""}`,
+      ].join("\n")).join("\n\n---\n\n"),
+      "图片/视频地址": "",
+    });
+  }
+  return rows.filter((row) => Object.values(row).some((value) => String(value || "").trim()));
+}
+
+function exportReviewMarkdown() {
+  const rows = reviewExportRows();
+  if (!rows.length) {
+    setStatus("还没有可导出的项目复盘。先添加备忘录或归档分镜。", "bad");
+    return;
+  }
+  const lines = [
+    `# ${state.projectId} 项目复盘`,
+    "",
+    `导出时间：${new Date().toLocaleString()}`,
+    "",
+    "## 复盘汇总",
+    "",
+    markdownTable(["来源", "复盘内容", "关联节点提示词/任务", "图片/视频地址"], rows),
+    "",
+  ];
+  const fileName = `${safeDownloadName(state.projectId)}_项目复盘.md`;
+  downloadTextFile(fileName, lines.join("\n"));
+  setStatus(`已导出项目复盘：${fileName}。`, "ok");
 }
 
 async function exportReusePackage() {
@@ -3115,7 +3664,7 @@ function renderAssets() {
     box.innerHTML = "";
     return;
   }
-  const visibleAssets = state.canvas.assets.filter((asset) => asset.is_library_asset || !["image", "video"].includes(asset.kind));
+  const visibleAssets = visibleAssetList();
   if (!visibleAssets.length) {
     box.innerHTML = `<p class="hint">这里现在只显示已标记为资产的图片/视频。导入本地素材会默认进来；其他结果可在节点右侧补标。</p>`;
     return;
@@ -3132,7 +3681,13 @@ function renderAssets() {
       boundCountByAsset.set(assetId, (boundCountByAsset.get(assetId) || 0) + 1);
     }
   }
-  box.innerHTML = visibleAssets.map((asset) => `
+  const missingNodeCount = visibleAssets.filter((asset) => !nodeCountByAsset.has(asset.asset_id)).length;
+  box.innerHTML = `
+    <div class="asset-bulk-actions">
+      <button id="layoutAllAssets" ${missingNodeCount ? "" : "disabled"}>一键全布置</button>
+      <span class="hint">${missingNodeCount ? `${missingNodeCount} 个还没放到画布` : "全部已在画布上"}</span>
+    </div>
+  ` + visibleAssets.map((asset) => `
     <div class="asset-card">
       <div class="asset-card-top">
         ${asset.url && asset.kind === "image" ? `<img class="asset-preview-thumb" src="${asset.url}" alt="${escapeHtml(asset.name)}">` : ""}
@@ -3160,6 +3715,7 @@ function renderAssets() {
       if (asset) addAssetNode(asset);
     });
   });
+  $("#layoutAllAssets")?.addEventListener("click", layoutAllVisibleAssets);
   box.querySelectorAll("[data-delete-asset]").forEach((button) => {
     button.addEventListener("click", () => {
       const assetId = button.dataset.deleteAsset;
@@ -3317,6 +3873,9 @@ function statusInfoFromJob(job) {
   if (job.status === "running" && job.last_lovart_reply) {
     return { label: "已回复·生成中", tone: "running", job };
   }
+  if (job.status === "queued" && Number(job.auto_retry_count || 0) > 0) {
+    return { label: "自动重提", tone: "waiting", job };
+  }
   const map = {
     queued: ["待提交", "waiting"],
     running: ["生成中", "running"],
@@ -3334,10 +3893,37 @@ function statusInfoFromJob(job) {
 
 function jobFailureReason(job) {
   const reason = String(job?.failure_reason || "");
-  if (!/已在 Lovart 平台处理|并发限制已在 Lovart 平台处理/.test(reason)) return reason;
+  if (!/已在 Lovart 平台处理|并发限制已在 Lovart 平台处理/.test(reason)) {
+    if (job?.platform === "jimeng_cli") return humanizeJimengFailureReason(reason);
+    return reason;
+  }
   if (job?.platform === "jimeng_cli") return "即梦当前还有任务在生成，平台限制了并发。等上一条完成后再提交。";
   if (job?.platform === "lovart") return "Lovart 并发限制已标记为处理完成，可重新提交任务。";
   return "当前平台并发限制已标记为处理完成，可重新提交任务。";
+}
+
+function humanizeJimengFailureReason(reason = "") {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  if (/generation failed:\s*final generation failed|final generation failed/i.test(text)) {
+    return "即梦平台最终生成失败。CLI 日志没有返回更细原因；常见是平台审核、人脸或生成阶段波动。只有提交后 2 分钟内返回此错误时，系统才会在本轮队列里最多自动重提 2 次；更久之后的失败不会自动重提，避免误判长任务浪费积分。";
+  }
+  if (/spawn EBADF/i.test(text)) {
+    return "本地图片预处理命令启动失败，任务还没有提交到即梦。已改为预处理失败时自动降级，请重新提交。";
+  }
+  if (/bad gateway|code\s*201007|commit phase/i.test(text)) {
+    return "即梦上传提交阶段平台网关失败，任务没有成功进入生成。通常是平台上传链路临时异常，建议稍后重新提交。";
+  }
+  if (/upload phase|no file upload/i.test(text)) {
+    return "即梦上传文件阶段失败，任务没有成功进入生成。通常是图片上传链路或文件读取异常，建议重新提交；若反复出现，先减少参考图数量。";
+  }
+  if (/^exit code 1$/i.test(text)) {
+    return "即梦 CLI 已启动但无错误详情地退出，任务没有成功进入生成。建议重新提交；若连续出现，先检查 dreamina user_credit 和参考图数量。";
+  }
+  if (/command timed out/i.test(text)) {
+    return "即梦 CLI 提交超时，任务没有拿到平台返回。建议稍后重新提交，或减少本次参考图数量。";
+  }
+  return text;
 }
 
 function canManuallyResolveRateLimit(job = {}) {
@@ -3427,14 +4013,14 @@ function scriptSegmentPreview(text, max = 90) {
 function renderShotTable() {
   const box = $("#shotTable");
   if (!state.shots.length) {
+    clearShotSelection();
     box.innerHTML = `<p class="hint">导入分镜后，这里会显示分镜控制表。</p>`;
     return;
   }
   const summary = shotStatusSummary();
-  const availableVideoModels = Array.from(new Set([
-    ...(state.params?.video?.models || []).filter((model) => model && model !== "agent-auto"),
-    ...Object.values(JIMENG_VIDEO_MODELS).flat(),
-  ]));
+  const selectedCount = selectedShotIds().length;
+  const availableVideoModels = availableShotVideoModels();
+  const sizeChoices = shotAspectRatioChoices();
   box.innerHTML = `
     <div class="shot-summary">
       <span>分镜 ${summary.total}</span>
@@ -3444,14 +4030,45 @@ function renderShotTable() {
       ${summary.blocked ? `<span class="bad">待处理 ${summary.blocked}</span>` : ""}
       ${summary.failed ? `<span class="bad">失败 ${summary.failed}</span>` : ""}
     </div>
+    <div class="shot-bulk-actions">
+      <button id="toggleAllShots">${selectedCount === state.shots.length ? "取消全选" : "全选分镜"}</button>
+      <button id="deleteSelectedShots" class="danger" ${selectedCount ? "" : "disabled"}>${selectedCount ? `删除 ${selectedCount} 条` : "删除分镜"}</button>
+    </div>
+    <div class="shot-bulk-panel">
+      <div class="shot-bulk-title">批量调整${selectedCount ? `：已选 ${selectedCount} 条` : ""}</div>
+      <div class="shot-inline-fields shot-inline-fields-wide">
+        <label class="field"><span>平台</span>
+          <select id="bulkShotPlatform" ${selectedCount ? "" : "disabled"}>
+            <option value="">不调整</option>
+            ${GENERATION_PLATFORMS.map((platform) => `<option value="${platform.value}">${escapeHtml(platform.label)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="field"><span>画幅</span>
+          <select id="bulkShotSize" ${selectedCount ? "" : "disabled"}>
+            <option value="">不调整</option>
+            ${sizeChoices.map((size) => `<option value="${escapeHtml(size)}">${escapeHtml(size)}</option>`).join("")}
+          </select>
+        </label>
+        <label class="field"><span>视频模型</span>
+          <select id="bulkShotVideoModel" ${selectedCount ? "" : "disabled"}>
+            <option value="">不调整</option>
+            ${availableVideoModels.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(shotModelLabel(model))}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      <button id="applyBulkShotParams" ${selectedCount ? "" : "disabled"}>${selectedCount ? `应用到 ${selectedCount} 条` : "应用批量参数"}</button>
+    </div>
   ` + state.shots.map((shot, index) => {
     const imageStatus = shotPartStatus(shot, "image");
     const videoStatus = shotPartStatus(shot, "video");
     const scriptSegment = scriptSegmentForShot(shot.shot_id);
+    const shotId = String(shot.shot_id || "");
+    const selected = state.selectedShotIds.includes(shotId);
     return `
     <details class="shot-card" data-shot-detail="${escapeHtml(shot.shot_id)}" ${state.openShotIds.includes(shot.shot_id) ? "open" : ""}>
       <summary>
         <div class="shot-summary-head">
+          <input class="shot-select-checkbox" type="checkbox" data-shot-select="${escapeHtml(shotId)}" aria-label="选择分镜 ${escapeHtml(shot.shot_id)}" ${selected ? "checked" : ""}>
           <div class="shot-title">分镜 ${escapeHtml(shot.shot_id)}</div>
           <div class="shot-status-row">
             ${shot.continuous ? `<span class="shot-status ready">连续镜头</span>` : ""}
@@ -3464,6 +4081,7 @@ function renderShotTable() {
         <span>衔接：${escapeHtml(transitionLabel(shot.transition))}</span>
         <span>平台：${escapeHtml(platformLabel(shot.platform))}</span>
         <span>模型：${escapeHtml(shotModelLabel(shot.video_model))}</span>
+        ${shot.size ? `<span>画幅：${escapeHtml(shot.size)}</span>` : ""}
         ${shot.duration ? `<span>时长：${escapeHtml(shot.duration)}</span>` : ""}
       </div>
       <details class="shot-params" data-shot-param-detail="${escapeHtml(shot.shot_id)}" ${state.openShotParamIds.includes(shot.shot_id) ? "open" : ""}>
@@ -3488,6 +4106,12 @@ function renderShotTable() {
             ${availableVideoModels.map((model) => `<option value="${escapeHtml(model)}" ${shot.video_model === model ? "selected" : ""}>${escapeHtml(shotModelLabel(model))}</option>`).join("")}
           </select>
         </label>
+        <label class="field"><span>画幅</span>
+          <select data-shot-index="${index}" data-shot-field="size">
+            <option value="" ${!shot.size ? "selected" : ""}>自动</option>
+            ${sizeChoices.map((size) => `<option value="${escapeHtml(size)}" ${shot.size === size ? "selected" : ""}>${escapeHtml(size)}</option>`).join("")}
+          </select>
+        </label>
         <label class="field"><span>时长</span><input data-shot-index="${index}" data-shot-field="duration" value="${escapeHtml(shot.duration || "")}" placeholder="例如 10s"></label>
         </div>
       </details>
@@ -3504,6 +4128,27 @@ function renderShotTable() {
     </details>
   `}).join("");
 
+  $("#toggleAllShots")?.addEventListener("click", () => {
+    const current = selectedShotIds();
+    state.selectedShotIds = current.length === state.shots.length ? [] : state.shots.map((shot) => String(shot.shot_id || "")).filter(Boolean);
+    const selected = new Set(state.selectedShotIds);
+    box.querySelectorAll("[data-shot-select]").forEach((input) => {
+      input.checked = selected.has(input.dataset.shotSelect);
+    });
+    updateShotBulkActions();
+  });
+  $("#deleteSelectedShots")?.addEventListener("click", deleteSelectedShots);
+  $("#applyBulkShotParams")?.addEventListener("click", () => {
+    applyBulkShotParams().catch((error) => setStatus(`批量调整失败：${error.message}`, "bad"));
+  });
+  box.querySelectorAll("[data-shot-select]").forEach((input) => {
+    input.addEventListener("click", (event) => event.stopPropagation());
+    input.addEventListener("change", () => {
+      setShotSelected(input.dataset.shotSelect, input.checked);
+      updateShotBulkActions();
+    });
+  });
+
   box.querySelectorAll("[data-shot-field]").forEach((input) => {
     const applyFieldChange = (event) => {
       const shot = state.shots[Number(input.dataset.shotIndex)];
@@ -3519,17 +4164,7 @@ function renderShotTable() {
       if (input.dataset.shotField === "video_prompt") {
         shot.duration = extractDurationFromPrompt(event.target.value) || shot.duration || "";
       }
-      const normalized = normalizeShotPlatformAndModel(
-        shot.platform,
-        String(shot.video_model || "").trim(),
-        shot.transition,
-        getPreferredSeedancePlatform()
-      );
-      shot.platform = normalized.platform;
-      shot.video_model = normalized.video_model;
-      const prompt = [shot.image_prompt, shot.video_prompt].filter(Boolean).join("\n\n");
-      shot.prompt = prompt;
-      shot.tag_refs = tagRefsForPrompt(prompt);
+      applyShotNormalization(shot);
     };
     input.addEventListener("input", (event) => {
       applyFieldChange(event);
@@ -3581,6 +4216,9 @@ function renderWorkflowList() {
   const box = $("#workflowList");
   if (!box) return;
   const workflow = workflowPreset();
+  const selectedCount = selectedShotIds().length;
+  const ungeneratedCount = ungeneratedShotIndexes().length;
+  const applyAllLabel = selectedCount ? `应用选中 ${selectedCount} 条分镜` : workflow.applyAllLabel;
   box.innerHTML = `
     <article class="workflow-card" data-workflow-id="${escapeHtml(workflow.id)}">
       <strong>${escapeHtml(workflow.label)}</strong>
@@ -3589,11 +4227,23 @@ function renderWorkflowList() {
         ${workflow.summary.map((item) => `<span class="workflow-chip">${escapeHtml(item)}</span>`).join("")}
       </div>
       <div class="workflow-actions">
-        <button id="applyDefaultWorkflow">${escapeHtml(workflow.applyAllLabel)}</button>
+        <button id="applyDefaultWorkflow">${escapeHtml(applyAllLabel)}</button>
+        <button id="applyUngeneratedWorkflow" ${ungeneratedCount ? "" : "disabled"}>应用未生成工作流分镜${ungeneratedCount ? `（${ungeneratedCount}）` : ""}</button>
       </div>
     </article>
   `;
-  $("#applyDefaultWorkflow")?.addEventListener("click", () => safeCreateShotNodes([], workflow.id));
+  $("#applyDefaultWorkflow")?.addEventListener("click", () => {
+    const indexes = selectedShotIndexes();
+    safeCreateShotNodes(indexes, workflow.id);
+  });
+  $("#applyUngeneratedWorkflow")?.addEventListener("click", () => {
+    const indexes = ungeneratedShotIndexes();
+    if (!indexes.length) {
+      setStatus("分镜表里没有未生成工作流的分镜。", "ok");
+      return;
+    }
+    safeCreateShotNodes(indexes, workflow.id);
+  });
 }
 
 function normalizeScriptForState(script = {}) {
@@ -4305,16 +4955,16 @@ function renderShotConflict() {
         <div>衔接方式：${escapeHtml(transitionLabel(current.current.transition))}</div>
         <div>平台：${escapeHtml(platformLabel(current.current.platform))}</div>
         <div>视频模型：${escapeHtml(shotModelLabel(current.current.video_model))}</div>
-        <div>图片提示词：${escapeHtml(current.current.image_prompt || "空")}</div>
-        <div>视频提示词：${escapeHtml(current.current.video_prompt || "空")}</div>
+        <div class="compare-prompt-block"><span>图片提示词</span><pre>${escapeHtml(current.current.image_prompt || "空")}</pre></div>
+        <div class="compare-prompt-block"><span>视频提示词</span><pre>${escapeHtml(current.current.video_prompt || "空")}</pre></div>
       </div>
       <div class="compare-card">
         <strong>这次导入的新内容</strong>
         <div>衔接方式：${escapeHtml(transitionLabel(current.next.transition))}</div>
         <div>平台：${escapeHtml(platformLabel(current.next.platform))}</div>
         <div>视频模型：${escapeHtml(shotModelLabel(current.next.video_model))}</div>
-        <div>图片提示词：${escapeHtml(current.next.image_prompt || "空")}</div>
-        <div>视频提示词：${escapeHtml(current.next.video_prompt || "空")}</div>
+        <div class="compare-prompt-block"><span>图片提示词</span><pre>${escapeHtml(current.next.image_prompt || "空")}</pre></div>
+        <div class="compare-prompt-block"><span>视频提示词</span><pre>${escapeHtml(current.next.video_prompt || "空")}</pre></div>
       </div>
     </div>
   `;
@@ -5051,6 +5701,8 @@ function renderJobs() {
           ${canManuallyResolveRateLimit(job) ? `<button data-mark-handled-job="${job.job_id}">解除并发阻塞</button>` : ""}
           ${job.status === "pending_confirmation" ? `<button data-confirm-job="${job.job_id}">确认并继续</button>` : ""}
           ${((job.lovart_thread_id || job.jimeng_submit_id) && job.status !== "downloaded") ? `<button data-refresh-job="${job.job_id}">刷新结果</button>` : ""}
+          ${job.status === "failed" ? `<button data-requeue-failed-job="${job.job_id}">重新提交</button>` : ""}
+          ${job.status === "queued" ? `<button class="danger" data-delete-queued-job="${job.job_id}">删除待提交</button>` : ""}
         </div>
         ${jobNeedsLovartReply(job) ? `
           <div class="job-reply-box">
@@ -5107,6 +5759,12 @@ function renderJobs() {
   });
   box.querySelectorAll("[data-mark-handled-job]").forEach((button) => {
     button.addEventListener("click", () => markRateLimitedHandled(button.dataset.markHandledJob));
+  });
+  box.querySelectorAll("[data-delete-queued-job]").forEach((button) => {
+    button.addEventListener("click", () => deleteQueuedJob(button.dataset.deleteQueuedJob));
+  });
+  box.querySelectorAll("[data-requeue-failed-job]").forEach((button) => {
+    button.addEventListener("click", () => requeueFailedJob(button.dataset.requeueFailedJob));
   });
   box.querySelectorAll("[data-job-detail]").forEach((detail) => {
     detail.addEventListener("toggle", () => {
@@ -5170,7 +5828,10 @@ function renderReview() {
       <details class="review-card" open>
         <summary>
           <strong>${escapeHtml(nodeTitle(memoNode))}</strong>
-          <span class="hint">关联 ${linked.length} 个节点</span>
+          <span class="review-summary-actions">
+            <span class="hint">关联 ${linked.length} 个节点</span>
+            <button type="button" data-focus-review-node="${escapeHtml(memoNode.id)}">定位到画布</button>
+          </span>
         </summary>
         <div class="review-body">
           <div class="review-note">${sanitizeMemoHtml(memoNode.data?.html || "") || `<p class="hint">还没写复盘内容。</p>`}</div>
@@ -5203,6 +5864,13 @@ function renderReview() {
   box.querySelectorAll("[data-restore-archive]").forEach((button) => {
     button.addEventListener("click", () => {
       restoreArchive(button.dataset.restoreArchive).catch((error) => setStatus(error.message, "bad"));
+    });
+  });
+  box.querySelectorAll("[data-focus-review-node]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      focusReviewNode(button.dataset.focusReviewNode);
     });
   });
 }
@@ -6039,6 +6707,11 @@ async function refreshJob(jobId, options = {}) {
       }
       return;
     }
+    if (result.pending) {
+      if (!silent) setStatus(result.message || "平台仍在生成中，系统会继续自动查询。", "ok");
+      scheduleAutoRefresh();
+      return;
+    }
     if (!silent) {
       setStatus("平台结果已下载并挂回画布。", "ok");
     } else if ((result.assets || []).length) {
@@ -6153,6 +6826,58 @@ async function markRateLimitedHandled(jobId) {
   setStatus(result.ok ? "并发限制已解除，可以重新提交；不会自动转到其他平台。" : "状态更新失败。", result.ok ? "ok" : "bad");
   if (state.bulkSubmit.active) {
     processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+  }
+}
+
+async function deleteQueuedJob(jobId) {
+  if (!jobId || state.jobActionLocks.has(jobId)) return;
+  state.jobActionLocks.add(jobId);
+  setStatus("正在删除待提交任务...");
+  try {
+    const result = await api("/api/jobs/delete", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, job_id: jobId }),
+    });
+    state.jobs = result.jobs || state.jobs.filter((job) => job.job_id !== jobId);
+    state.assetLibrary = result.asset_library || state.assetLibrary;
+    renderJobs();
+    renderAssetLibrary();
+    renderInspector();
+    setStatus("已删除待提交任务。", "ok");
+    if (state.bulkSubmit.active) {
+      processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+    }
+  } catch (error) {
+    setStatus(`删除待提交任务失败：${error.message}`, "bad");
+  } finally {
+    state.jobActionLocks.delete(jobId);
+  }
+}
+
+async function requeueFailedJob(jobId) {
+  if (!jobId || state.jobActionLocks.has(jobId)) return;
+  state.jobActionLocks.add(jobId);
+  setStatus("正在重新加入任务队列...");
+  try {
+    const result = await api("/api/jobs/requeue-failed", {
+      method: "POST",
+      body: JSON.stringify({ project_id: state.projectId, job_id: jobId }),
+    });
+    state.jobs = result.jobs || state.jobs;
+    state.canvas = result.canvas || state.canvas;
+    state.assetLibrary = result.asset_library || state.assetLibrary;
+    renderJobs();
+    renderAssetLibrary();
+    renderInspector();
+    scheduleAutoRefresh();
+    setStatus(result.job?.failure_reason || "已重新加入任务队列。", "ok");
+    if (state.bulkSubmit.active) {
+      processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
+    }
+  } catch (error) {
+    setStatus(`重新提交失败：${error.message}`, "bad");
+  } finally {
+    state.jobActionLocks.delete(jobId);
   }
 }
 
@@ -6389,6 +7114,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#projectCreateConfirm").addEventListener("click", createProjectFromPicker);
   $("#exportReusePackage")?.addEventListener("click", () => {
     exportReusePackage().catch((error) => setStatus(`导出复用包失败：${error.message}`, "bad"));
+  });
+  $("#exportReviewMarkdown")?.addEventListener("click", () => {
+    exportReviewMarkdown();
   });
   $("#reusePackageFile")?.addEventListener("change", async (event) => {
     const file = event.target.files?.[0];

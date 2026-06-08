@@ -10,6 +10,7 @@ const {
   assetsFromLovartResult,
   assetTemplateOutputName,
   blockingJobs,
+  buildJimengReferencePrompt,
   buildReferencePromptText,
   buildTags,
   canStartQueuedJob,
@@ -17,13 +18,19 @@ const {
   connectImageResultsToShotVideo,
   createProject,
   defaultPromptFeedbackPresets,
+  deleteQueuedJobFromProject,
+  deleteShotsFromProject,
   deepSeekHttpErrorMessage,
   extractJsonObject,
   exportProjectReusePackage,
   importProjectReusePackage,
+  canAutoRetryJimengJob,
+  isJimengFinalGenerationFailure,
   isJimengVipModel,
+  jimengQueryTimeoutPendingReason,
   jobBlocksSubmission,
   loadProject,
+  mergeCanvasForSave,
   normalizeDeepSeekBaseUrl,
   normalizePromptOptimization,
   placeResultNodes,
@@ -33,19 +40,23 @@ const {
   pruneDormantJobsForTarget,
   rateLimitHandledReason,
   recordProcessedDownloads,
+  requeueFailedJobFromProject,
   safeName,
   saveScript,
   uniquePath,
 } = require("./server");
 
-const shots = parseShots(`1 | @女医生 在 @门诊室 看病例 | @女医生 抬头问话
-2 |  | @女医生 问 @男患者
-3\t@男患者 焦虑地看向 @门诊室\t@男患者 低头叹气`);
+const shots = parseShots(`1 | @女医生 | @门诊室
+2 |  | @女医生
+3\t@男患者\t@门诊室`);
 
 assert.equal(shots.length, 3);
 assert.deepEqual(shots[0].tag_refs, ["@女医生", "@门诊室"]);
 assert.equal(shots[1].image_prompt, "");
-assert.equal(shots[1].video_prompt, "@女医生 问 @男患者");
+assert.equal(shots[1].video_prompt, "@女医生");
+
+const mixedLanguageTagShots = parseShots("1 | @Jack Blackwood 黑木伍德 | @Misty Dock 雾港码头");
+assert.deepEqual(mixedLanguageTagShots[0].tag_refs, ["@Jack Blackwood 黑木伍德", "@Misty Dock 雾港码头"]);
 
 const tags = buildTags(shots, [
   {
@@ -66,7 +77,7 @@ const appSource = fs.readFileSync(path.join(__dirname, "public", "app.js"), "utf
 const tagHelperSource = appSource.slice(appSource.indexOf("function tagsFromText"), appSource.indexOf("function firstAvailableModel"));
 const tagHelperContext = { result: null };
 vm.runInNewContext(`${tagHelperSource}
-result = tagRefsForPrompt("@里奥父亲 看向门口", [
+result = tagRefsForPrompt("@里奥父亲\\n看向门口", [
   { label: "@里奥", aliases: [] },
   { label: "@里奥父亲", aliases: [] },
 ]);`, tagHelperContext);
@@ -76,7 +87,67 @@ result = tagRefsForPrompt("@Night Beach Camp — fog rolls in", [
   { label: "@Night", aliases: [] },
   { label: "@Night Beach Camp", aliases: [] },
 ]);`, tagHelperContext);
-assert.deepEqual(tagHelperContext.result, ["@Night Beach Camp"]);
+assert.deepEqual(tagHelperContext.result, ["@Night Beach Camp — fog rolls in"]);
+vm.runInNewContext(`${tagHelperSource}
+result = tagRefsForPrompt("@Jack Blackwood 黑木伍德\\n【镜头1】他站在码头。", []);`, tagHelperContext);
+assert.deepEqual(tagHelperContext.result, ["@Jack Blackwood 黑木伍德"]);
+vm.runInNewContext(`${tagHelperSource}
+result = [
+  exactTagBindingName("@里奥"),
+  exactTagBindingName("里奥"),
+  exactTagBindingName("  @Night Beach Camp  "),
+];`, tagHelperContext);
+assert.deepEqual(tagHelperContext.result, ["里奥", "里奥", "Night Beach Camp"]);
+
+const autoBindSource = appSource
+  .slice(appSource.indexOf("async function autoBindTagsByExactAssetName"), appSource.indexOf("function renderTagPickerPreview"))
+  .replace("async function autoBindTagsByExactAssetName", "function autoBindTagsByExactAssetName")
+  .replace("await api(", "api(");
+const autoBindContext = {
+  result: null,
+  state: {
+    projectId: "测试项目",
+    canvas: {
+      assets: [{ asset_id: "asset_1", name: "original-file-name.png", is_library_asset: true }],
+      nodes: [{ id: "node_1", type: "image", data: { asset_id: "asset_1", title: "里奥" } }],
+    },
+    tags: [{ tag_id: "tag_1", label: "@里奥", bound_asset_ids: [] }],
+  },
+  exactTagBindingName: (text) => String(text || "").trim().replace(/^@/, "").trim(),
+  api: () => ({ ok: true }),
+  renderTags() {},
+  renderToolbarState() {},
+  renderInspector() {},
+  alert() {},
+};
+vm.runInNewContext(`
+function libraryAssets() { return state.canvas.assets.filter((asset) => asset.is_library_asset); }
+function assetById(assetId) { return state.canvas.assets.find((asset) => asset.asset_id === assetId); }
+function setStatus(message, kind) { result = { message, kind, tags: state.tags }; }
+${autoBindSource}
+autoBindTagsByExactAssetName();`, autoBindContext);
+assert.deepEqual(autoBindContext.state.tags[0].bound_asset_ids, ["asset_1"]);
+assert.match(autoBindContext.result.message, /节点名称/);
+
+const seedanceImportSource = appSource.slice(appSource.indexOf("function isKlingModelName"), appSource.indexOf("function splitParametersByPlatform"));
+const seedanceImportContext = { result: null };
+vm.runInNewContext(`
+function normalizePlatform(value) { return value === "jimeng_cli" ? "jimeng_cli" : "lovart"; }
+function extractDurationFromPrompt() { return ""; }
+function extractAspectRatioFromPrompt() { return ""; }
+${seedanceImportSource}
+result = applySeedancePlatformToImportedShots([
+  {
+    shot_id: "1",
+    platform: "lovart",
+    transition: "video_direct",
+    video_model: "generate_video_seedance_v2_0",
+    video_prompt: "@里奥\\n8秒。16:9。",
+  },
+], "jimeng_cli")[0];`, seedanceImportContext);
+assert.equal(seedanceImportContext.result.platform, "jimeng_cli");
+assert.equal(seedanceImportContext.result.video_model, "seedance2.0");
+
 const statusHelperSource = appSource.slice(appSource.indexOf("function statusInfoFromJob"), appSource.indexOf("function jobFailureReason"));
 const statusHelperContext = { result: null };
 vm.runInNewContext(`${statusHelperSource}
@@ -85,6 +156,62 @@ assert.equal(statusHelperContext.result.label, "提交中");
 vm.runInNewContext(`${statusHelperSource}
 result = statusInfoFromJob({ status: "running", platform: "lovart", lovart_thread_id: "thread_1" });`, statusHelperContext);
 assert.equal(statusHelperContext.result.label, "生成中");
+
+const generatorUpsertSource = `
+const GENERATION_PLATFORMS = [{ value: "lovart" }, { value: "jimeng_cli" }];
+const state = {
+  canvas: {
+    nodes: [
+      {
+        id: "video_gen_1",
+        type: "videoGen",
+        x: 0,
+        y: 0,
+        data: {
+          shot_id: "1",
+          shot_role: "video",
+          platform: "lovart",
+          common_parameters: { model: "generate_video_seedance_v2_0_fast", duration: "5s" },
+          platform_parameters: { lovart: { feature: "all_reference" } },
+        },
+      },
+    ],
+    edges: [],
+  },
+};
+function uid(prefix) { return prefix + "_test"; }
+function workflowPreset() { return { id: "story", label: "故事工作流" }; }
+function normalizePlatform(value) { return GENERATION_PLATFORMS.some((item) => item.value === value) ? value : "lovart"; }
+${appSource.slice(appSource.indexOf("function splitParametersByPlatform"), appSource.indexOf("function defaultImageParameters"))}
+${appSource.slice(appSource.indexOf("function findShotNode"), appSource.indexOf("function upsertEdge"))}
+${appSource.slice(appSource.indexOf("function upsertShotGeneratorNode"), appSource.indexOf("function upsertAssetTemplateNode"))}
+const updated = upsertShotGeneratorNode(
+  "videoGen",
+  { shot_id: "1", platform: "jimeng_cli" },
+  "video",
+  { x: 100, y: 100 },
+  "next prompt",
+  { platform: "jimeng_cli", model: "seedance2.0", duration: "8s", mode: "multimodal2video", video_resolution: "720p" },
+  "分镜 1 视频"
+);
+result = {
+  platform: updated.data.platform,
+  model: updated.data.common_parameters.model,
+  duration: updated.data.common_parameters.duration,
+  mode: updated.data.platform_parameters.jimeng_cli.mode,
+  lovartFeature: updated.data.platform_parameters.lovart.feature,
+};
+`;
+const generatorUpsertContext = { result: null };
+vm.runInNewContext(generatorUpsertSource, generatorUpsertContext);
+assert.deepEqual(generatorUpsertContext.result, {
+  platform: "jimeng_cli",
+  model: "seedance2.0",
+  duration: "8s",
+  mode: "multimodal2video",
+  lovartFeature: "all_reference",
+});
+
 const lovartReferenceText = buildReferencePromptText("image", [
   {
     asset_kind: "image",
@@ -104,17 +231,96 @@ const lovartReferenceText = buildReferencePromptText("image", [
 assert.match(lovartReferenceText, /附件1 \/ 图片1 = @里奥父亲 \/ leo_father\.png（角色参考）/);
 assert.match(lovartReferenceText, /附件2 \/ 图片2 = @里奥 \/ leo\.png（角色参考）/);
 assert.ok(!lovartReferenceText.includes("角色1参考"));
+const tailFrameReferenceText = buildReferencePromptText("video", [
+  {
+    asset_kind: "image",
+    asset_name: "tail.png",
+    primary_tag_label: "@上一镜尾帧",
+    tag_labels: ["@上一镜尾帧"],
+    reference_role: "tail_frame",
+  },
+]);
+assert.match(tailFrameReferenceText, /附件1 \/ 图片1 = @上一镜尾帧 \/ tail\.png（尾帧参考）/);
+assert.match(tailFrameReferenceText, /不要当成首帧/);
+const jimengReferenceText = buildJimengReferencePrompt([
+  {
+    asset: { kind: "image" },
+    asset_name: "tail.png",
+    primary_tag_label: "@上一镜尾帧",
+    reference_role: "tail_frame",
+  },
+], "multimodal2video");
+assert.match(jimengReferenceText, /@图片1=上一镜尾帧（尾帧参考）/);
+const jimengRoleOnlyReferenceText = buildJimengReferencePrompt([
+  {
+    asset: { kind: "image" },
+    asset_name: "",
+    primary_tag_label: "",
+    reference_role: "character_reference",
+  },
+  {
+    asset: { kind: "image" },
+    asset_name: "",
+    primary_tag_label: "",
+    reference_role: "scene_reference",
+  },
+  {
+    asset: { kind: "image" },
+    asset_name: "",
+    primary_tag_label: "",
+    reference_role: "first_frame",
+  },
+], "multimodal2video");
+assert.match(jimengRoleOnlyReferenceText, /@图片1=角色参考/);
+assert.match(jimengRoleOnlyReferenceText, /@图片2=场景参考/);
+assert.match(jimengRoleOnlyReferenceText, /@图片3=首帧参考/);
+const jimengGeneratedFrameReferenceText = buildJimengReferencePrompt([
+  {
+    asset: { kind: "image", name: "分镜分镜01-3-14_静帧" },
+    asset_name: "分镜分镜01-3-14_静帧",
+    primary_tag_label: "",
+    reference_role: "first_frame",
+  },
+], "multimodal2video");
+assert.match(jimengGeneratedFrameReferenceText, /@图片1=首帧参考/);
+assert.ok(!jimengGeneratedFrameReferenceText.includes("分镜分镜01-3-14_静帧"));
 assert.equal(rateLimitHandledReason({ platform: "lovart" }), "Lovart 并发限制已标记为处理完成，可重新提交任务。");
+assert.equal(isJimengFinalGenerationFailure("generation failed: final generation failed"), true);
+const jimengRetryNowMs = Date.parse("2026-06-05T12:01:00.000Z");
+assert.equal(
+  canAutoRetryJimengJob(
+    { platform: "jimeng_cli", auto_retry_count: 1, submitted_at: "2026-06-05T12:00:30.000Z" },
+    "generation failed: final generation failed",
+    { nowMs: jimengRetryNowMs }
+  ),
+  true
+);
+assert.equal(
+  canAutoRetryJimengJob(
+    { platform: "jimeng_cli", auto_retry_count: 0, submitted_at: "2026-06-05T11:58:59.000Z" },
+    "generation failed: final generation failed",
+    { nowMs: jimengRetryNowMs }
+  ),
+  false
+);
+assert.equal(canAutoRetryJimengJob({ platform: "jimeng_cli", auto_retry_count: 0 }, "generation failed: final generation failed", { nowMs: jimengRetryNowMs }), false);
+assert.equal(canAutoRetryJimengJob({ platform: "jimeng_cli", auto_retry_count: 2, submitted_at: "2026-06-05T12:00:30.000Z" }, "generation failed: final generation failed", { nowMs: jimengRetryNowMs }), false);
+assert.equal(canAutoRetryJimengJob({ platform: "lovart", auto_retry_count: 0, submitted_at: "2026-06-05T12:00:30.000Z" }, "generation failed: final generation failed", { nowMs: jimengRetryNowMs }), false);
 assert.equal(isJimengVipModel("seedance2.0fast_vip"), true);
 assert.equal(isJimengVipModel("seedance2.0fast"), false);
+assert.match(jimengQueryTimeoutPendingReason(120000), /继续自动查询，不判定失败/);
 const jimengRateLimitedJob = { status: "rate_limited", platform: "jimeng_cli" };
-const activeJimengJob = { status: "running", platform: "jimeng_cli", jimeng_submit_id: "submit_1" };
+const activeJimengJob = { status: "running", platform: "jimeng_cli", jimeng_submit_id: "submit_1", parameters: { model: "seedance2.0fast" } };
+const activeJimengSlowJob = { status: "running", platform: "jimeng_cli", jimeng_submit_id: "submit_2", parameters: { model: "seedance2.0" } };
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast" }, [jimengRateLimitedJob, activeJimengJob]), true);
+assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0" }, [jimengRateLimitedJob, activeJimengJob]), false);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast" }, [jimengRateLimitedJob]), false);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast_vip" }), false);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "lovart", model: "generate_video_seedance_v2_0_fast" }), false);
 assert.equal(blockingJobs([jimengRateLimitedJob], { platform: "jimeng_cli", model: "seedance2.0_vip" }).length, 0);
 assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0fast" } }), false);
+assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0" } }), true);
+assert.equal(canStartQueuedJob([activeJimengJob, activeJimengSlowJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0" } }), false);
 assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0fast_vip" } }), true);
 assert.equal(
   canStartQueuedJob(
@@ -212,6 +418,30 @@ assert.equal(modelAwareHtmlShots[1].platform, "jimeng_cli");
 assert.equal(modelAwareHtmlShots[1].transition, "continue_prev_tail");
 assert.equal(modelAwareHtmlShots[1].expected_prev_shot_id, "分镜7-1-1");
 
+const imagePromptHtmlShots = parseShotlistHtml(`
+  <h2 class="block-title">Episode 3</h2>
+  <tr data-scene="2" data-plan="WS">
+    <td class="c-num">01</td>
+    <td class="c-model"><span class="field-pill">Seedance2.0</span></td>
+    <td class="c-link"><span class="link-pill">新建首帧</span></td>
+    <td class="c-image-prompt">
+      <div class="image-prompt-head"><b>图片提示词 1</b></div>
+      <div class="image-prompt-block">@测试首帧骑手石门
+A lone rider before a broken stone gate, 16:9 first frame.</div>
+    </td>
+    <td class="c-prompt">
+      <div class="prompt-head"><b>提示词 1</b></div>
+      <div class="prompt-block">@测试首帧骑手石门
+从新建首帧开始生成视频。8秒。16:9。</div>
+    </td>
+  </tr>
+`, "lovart");
+assert.equal(imagePromptHtmlShots.length, 1);
+assert.equal(imagePromptHtmlShots[0].shot_id, "分镜3-2-1");
+assert.match(imagePromptHtmlShots[0].image_prompt, /A lone rider before a broken stone gate/);
+assert.match(imagePromptHtmlShots[0].video_prompt, /从新建首帧开始生成视频/);
+assert.deepEqual(imagePromptHtmlShots[0].tag_refs, ["@测试首帧骑手石门"]);
+
 const sectionHtmlShots = parseShotlistHtml(`
   <h2 class="block-title">Episode 1 — Fog Island</h2>
   <section class="scene" id="sc9">
@@ -231,7 +461,7 @@ const sectionHtmlShots = parseShotlistHtml(`
 `, "lovart");
 assert.equal(sectionHtmlShots.length, 2);
 assert.equal(sectionHtmlShots[1].shot_id, "分镜1-10-12");
-assert.ok(sectionHtmlShots[0].tag_refs.includes("@Night Beach Camp"));
+assert.ok(sectionHtmlShots[0].tag_refs.includes("@Night Beach Camp — foggy camp."));
 assert.ok(!sectionHtmlShots[0].tag_refs.includes("@Night"));
 
 const project = createProject("测试项目");
@@ -253,6 +483,32 @@ assert.ok(Array.isArray(loaded.canvas.nodes));
 assert.ok(Array.isArray(loaded.prompt_context.learnings));
 assert.deepEqual(loaded.prompt_context.feedback_presets, defaultPromptFeedbackPresets());
 assert.ok(Array.isArray(loaded.script.segments));
+
+fs.writeFileSync(path.join(__dirname, "projects", "测试项目", "canvas.json"), JSON.stringify({
+  nodes: [
+    { id: "img_a", type: "image", data: { asset_id: "asset_a" } },
+    { id: "video_gen", type: "videoGen", data: {} },
+    { id: "generated_result", type: "image", data: { asset_id: "asset_generated_result", source_job_id: "job_result" } },
+  ],
+  edges: [
+    { id: "old_manual_edge", source: "img_a", target: "video_gen" },
+    { id: "generated_edge", source: "generated_result", target: "video_gen" },
+  ],
+  assets: [
+    { asset_id: "asset_a", name: "参考图", kind: "image", source: "input" },
+    { asset_id: "asset_generated_result", name: "生成结果", kind: "image", source: "generated" },
+  ],
+}, null, 2));
+const mergedAfterEdgeDelete = mergeCanvasForSave("测试项目", {
+  nodes: [
+    { id: "img_a", type: "image", data: { asset_id: "asset_a" } },
+    { id: "video_gen", type: "videoGen", data: {} },
+  ],
+  edges: [],
+  assets: [{ asset_id: "asset_a", name: "参考图", kind: "image", source: "input" }],
+});
+assert.ok(!mergedAfterEdgeDelete.edges.some((edge) => edge.id === "old_manual_edge"));
+assert.ok(mergedAfterEdgeDelete.edges.some((edge) => edge.id === "generated_edge"));
 
 const reusableFile = path.join(__dirname, "projects", "测试项目", "input", "里奥.png");
 fs.writeFileSync(reusableFile, "reusable image");
@@ -297,6 +553,113 @@ const savedScript = saveScript("测试项目", {
 });
 assert.equal(savedScript.segments.length, 1);
 assert.equal(savedScript.bindings[0].shot_id, "1");
+
+createProject("删除分镜测试");
+const deleteProjectDir = path.join(__dirname, "projects", "删除分镜测试");
+fs.writeFileSync(path.join(deleteProjectDir, "shots.json"), JSON.stringify([
+  { shot_id: "1", image_prompt: "@里奥 image", video_prompt: "@里奥 video", tag_refs: ["@里奥"] },
+  { shot_id: "2", image_prompt: "@玛雅 image", video_prompt: "@玛雅 video", tag_refs: ["@玛雅"] },
+], null, 2));
+fs.writeFileSync(path.join(deleteProjectDir, "canvas.json"), JSON.stringify({
+  nodes: [
+    { id: "image_gen_1", type: "imageGen", data: { shot_id: "1", shot_role: "image" } },
+    { id: "video_result_1", type: "video", data: { shot_id: "1", asset_id: "asset_done_1" } },
+    { id: "image_gen_2", type: "imageGen", data: { shot_id: "2", shot_role: "image" } },
+    { id: "control_1", type: "globalControl", data: { title: "全局控制" } },
+  ],
+  edges: [
+    { id: "edge_1", source: "control_1", target: "image_gen_1" },
+    { id: "edge_2", source: "control_1", target: "image_gen_2" },
+  ],
+  assets: [
+    { asset_id: "asset_done_1", name: "分镜1成片", kind: "video", source: "generated" },
+    { asset_id: "asset_input", name: "里奥", kind: "image", source: "input" },
+  ],
+}, null, 2));
+fs.writeFileSync(path.join(deleteProjectDir, "jobs.json"), JSON.stringify([
+  { job_id: "job_done_1", status: "downloaded", target_node_id: "image_gen_1", shot_ids: ["1"], output_asset_ids: ["asset_done_1"] },
+  { job_id: "job_done_2", status: "downloaded", target_node_id: "image_gen_2", shot_ids: ["2"] },
+], null, 2));
+fs.writeFileSync(path.join(deleteProjectDir, "tags.json"), JSON.stringify([
+  { tag_id: "tag_leo", label: "@里奥", referenced_by_shot_ids: ["1"], bound_asset_ids: ["asset_input"] },
+  { tag_id: "tag_maya", label: "@玛雅", referenced_by_shot_ids: ["2"], bound_asset_ids: [] },
+], null, 2));
+fs.writeFileSync(path.join(deleteProjectDir, "prompt_context.json"), JSON.stringify({
+  learnings: [],
+  feedback_presets: defaultPromptFeedbackPresets(),
+  revisions: [
+    { revision_id: "rev_1", shot_id: "1" },
+    { revision_id: "rev_2", shot_id: "2" },
+  ],
+}, null, 2));
+fs.writeFileSync(path.join(deleteProjectDir, "script.json"), JSON.stringify({
+  source_text: "script",
+  segments: [
+    { segment_id: "seg_1", text: "shot 1" },
+    { segment_id: "seg_2", text: "shot 2" },
+  ],
+  bindings: [
+    { shot_id: "1", segment_id: "seg_1" },
+    { shot_id: "2", segment_id: "seg_2" },
+  ],
+}, null, 2));
+const deletedShots = deleteShotsFromProject("删除分镜测试", ["1"]);
+assert.equal(deletedShots.counts.shots, 1);
+assert.equal(deletedShots.counts.nodes, 2);
+assert.deepEqual(deletedShots.data.shots.map((shot) => shot.shot_id), ["2"]);
+assert.deepEqual(deletedShots.data.canvas.nodes.map((node) => node.id).sort(), ["control_1", "image_gen_2"]);
+assert.deepEqual(deletedShots.data.canvas.edges.map((edge) => edge.id), ["edge_2"]);
+assert.ok(!deletedShots.data.canvas.assets.some((asset) => asset.asset_id === "asset_done_1"));
+assert.deepEqual(deletedShots.data.jobs.map((job) => job.job_id), ["job_done_2"]);
+assert.deepEqual(deletedShots.data.tags.map((tag) => tag.label), ["@玛雅"]);
+assert.deepEqual(deletedShots.data.prompt_context.revisions.map((revision) => revision.revision_id), ["rev_2"]);
+assert.deepEqual(deletedShots.data.script.bindings.map((binding) => binding.shot_id), ["2"]);
+assert.deepEqual(deletedShots.data.script.segments.map((segment) => segment.segment_id), ["seg_2"]);
+
+createProject("删除待提交任务测试");
+const queuedJobProjectDir = path.join(__dirname, "projects", "删除待提交任务测试");
+fs.writeFileSync(path.join(queuedJobProjectDir, "jobs.json"), JSON.stringify([
+  { job_id: "job_queued", status: "queued", asset_template_id: "tpl_queued" },
+  { job_id: "job_running", status: "running", target_node_id: "video_gen_1" },
+], null, 2));
+fs.writeFileSync(path.join(queuedJobProjectDir, "asset_library.json"), JSON.stringify({
+  templates: [
+    { template_id: "tpl_queued", status: "queued", failure_reason: "waiting" },
+  ],
+}, null, 2));
+const deletedQueuedJob = deleteQueuedJobFromProject("删除待提交任务测试", "job_queued");
+assert.equal(deletedQueuedJob.ok, true);
+assert.deepEqual(deletedQueuedJob.jobs.map((job) => job.job_id), ["job_running"]);
+assert.equal(deletedQueuedJob.asset_library.templates[0].status, "idle");
+assert.equal(deletedQueuedJob.asset_library.templates[0].failure_reason, "");
+const rejectedRunningJobDelete = deleteQueuedJobFromProject("删除待提交任务测试", "job_running");
+assert.equal(rejectedRunningJobDelete.ok, false);
+assert.match(rejectedRunningJobDelete.error, /只能删除待提交任务/);
+assert.deepEqual(loadProject("删除待提交任务测试").jobs.map((job) => job.job_id), ["job_running"]);
+
+fs.writeFileSync(path.join(queuedJobProjectDir, "jobs.json"), JSON.stringify([
+  {
+    job_id: "job_failed",
+    status: "failed",
+    platform: "jimeng_cli",
+    target_node_id: "video_gen_1",
+    failure_reason: "generation failed: final generation failed",
+    auto_retry_count: 2,
+    jimeng_submit_id: "old_submit",
+    submitted_at: "2026-06-05T12:00:30.000Z",
+    output_asset_ids: ["asset_old"],
+    processed_download_keys: ["download_old"],
+  },
+], null, 2));
+const requeuedFailedJob = requeueFailedJobFromProject("删除待提交任务测试", "job_failed");
+assert.equal(requeuedFailedJob.ok, true);
+assert.equal(requeuedFailedJob.job.status, "queued");
+assert.equal(requeuedFailedJob.job.auto_retry_count, 0);
+assert.equal(requeuedFailedJob.job.jimeng_submit_id, undefined);
+assert.equal(requeuedFailedJob.job.submitted_at, undefined);
+assert.deepEqual(requeuedFailedJob.job.output_asset_ids, []);
+assert.deepEqual(requeuedFailedJob.job.processed_download_keys, []);
+assert.equal(requeuedFailedJob.job.manual_retry_count, 1);
 
 const optimized = normalizePromptOptimization({ revised_image_prompt: "new image" }, { image_prompt: "old image", video_prompt: "old video" });
 assert.equal(optimized.revised_image_prompt, "new image");
