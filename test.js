@@ -9,6 +9,7 @@ process.env.AI_VIDEO_PROJECTS_DIR = path.join(__dirname, "projects");
 const {
   assetsFromLovartResult,
   assetTemplateOutputName,
+  autoSwitchJimengImageModeForInputs,
   blockingJobs,
   buildJimengReferencePrompt,
   buildReferencePromptText,
@@ -25,12 +26,14 @@ const {
   exportProjectReusePackage,
   importProjectReusePackage,
   canAutoRetryJimengJob,
+  humanizeLovartFailureReason,
   isJimengFinalGenerationFailure,
   isJimengVipModel,
   jimengQueryTimeoutPendingReason,
   jobBlocksSubmission,
   loadProject,
   mergeCanvasForSave,
+  missingBoundTagsForPrompt,
   normalizeDeepSeekBaseUrl,
   normalizePromptOptimization,
   placeResultNodes,
@@ -72,8 +75,55 @@ assert.equal(doctor.tag_id, "tag_existing");
 assert.deepEqual(doctor.bound_asset_ids, ["asset_1"]);
 assert.deepEqual(doctor.referenced_by_shot_ids, ["1", "2"]);
 
+const nodeScopedMissingTags = [
+  { tag_id: "tag_leo", label: "@里奥", bound_asset_ids: ["asset_leo"] },
+  { tag_id: "tag_father", label: "@里奥父亲", bound_asset_ids: [] },
+  { tag_id: "tag_maya", label: "@玛雅", bound_asset_ids: [] },
+];
+assert.deepEqual(missingBoundTagsForPrompt("@里奥\nenters", nodeScopedMissingTags), []);
+assert.deepEqual(missingBoundTagsForPrompt("@里奥父亲\nenters", nodeScopedMissingTags).map((tag) => tag.label), ["@里奥父亲"]);
+assert.deepEqual(missingBoundTagsForPrompt("no project tags here", nodeScopedMissingTags), []);
+
+const jimengImageGeneratorData = {
+  platform: "jimeng_cli",
+  common_parameters: { model: "5.0", size: "16:9" },
+  platform_parameters: { jimeng_cli: { mode: "text2image", resolution_type: "2k" } },
+};
+assert.equal(autoSwitchJimengImageModeForInputs(jimengImageGeneratorData, [{ asset_kind: "image" }]), true);
+assert.equal(jimengImageGeneratorData.platform_parameters.jimeng_cli.mode, "image2image");
+
 assert.equal(safeName('a/b:c*?"<>|'), "a_b_c______");
 const appSource = fs.readFileSync(path.join(__dirname, "public", "app.js"), "utf8");
+const promptDiffHelperSource = appSource.slice(
+  appSource.indexOf("function normalizePromptForComparison"),
+  appSource.indexOf("function shotHasWorkflowNodes")
+);
+const promptDiffContext = {
+  result: null,
+  state: {
+    shots: [
+      { shot_id: "1", video_prompt: "原提示词\n" },
+      { shot_id: "2", video_prompt: "没有修改" },
+      { shot_id: "3", video_prompt: "缺少节点" },
+    ],
+    canvas: {
+      nodes: [
+        { id: "video_1", type: "videoGen", data: { shot_id: "1", shot_role: "video", prompt: "修改后提示词" } },
+        { id: "video_2", type: "videoGen", data: { shot_id: "2", shot_role: "video", prompt: "没有修改  \r\n" } },
+      ],
+    },
+  },
+  selectedShotIds: () => ["1", "2", "3"],
+};
+vm.runInNewContext(`${promptDiffHelperSource}
+result = selectedShotVideoPromptDiffs();`, promptDiffContext);
+assert.deepEqual(JSON.parse(JSON.stringify(promptDiffContext.result.diffs)), [{
+  shot_id: "1",
+  node_id: "video_1",
+  original_video_prompt: "原提示词\n",
+  node_video_prompt: "修改后提示词",
+}]);
+assert.deepEqual(JSON.parse(JSON.stringify(promptDiffContext.result.missingNodeShotIds)), ["3"]);
 const tagHelperSource = appSource.slice(appSource.indexOf("function tagsFromText"), appSource.indexOf("function firstAvailableModel"));
 const tagHelperContext = { result: null };
 vm.runInNewContext(`${tagHelperSource}
@@ -285,6 +335,17 @@ const jimengGeneratedFrameReferenceText = buildJimengReferencePrompt([
 assert.match(jimengGeneratedFrameReferenceText, /@图片1=首帧参考/);
 assert.ok(!jimengGeneratedFrameReferenceText.includes("分镜分镜01-3-14_静帧"));
 assert.equal(rateLimitHandledReason({ platform: "lovart" }), "Lovart 并发限制已标记为处理完成，可重新提交任务。");
+const lovartUploadTimeoutReason = humanizeLovartFailureReason("urllib.error.URLError: <urlopen error [Errno 60] Operation timed out>", "upload");
+assert.match(lovartUploadTimeoutReason, /Lovart 参考素材上传失败：连接 Lovart 上传服务超时/);
+assert.ok(!lovartUploadTimeoutReason.includes("Traceback"));
+assert.match(
+  humanizeLovartFailureReason("Error: Project '4b37f2711ec34d64be72f0165b414be0' does not exist"),
+  /Lovart 项目不存在/
+);
+assert.match(
+  humanizeLovartFailureReason("Error: Connection failed after 3 attempts: <urlopen error [Errno 54] Connection reset by peer>", "project"),
+  /Lovart 项目创建失败：连接被中断/
+);
 assert.equal(isJimengFinalGenerationFailure("generation failed: final generation failed"), true);
 const jimengRetryNowMs = Date.parse("2026-06-05T12:01:00.000Z");
 assert.equal(
@@ -312,16 +373,23 @@ assert.match(jimengQueryTimeoutPendingReason(120000), /继续自动查询，不�
 const jimengRateLimitedJob = { status: "rate_limited", platform: "jimeng_cli" };
 const activeJimengJob = { status: "running", platform: "jimeng_cli", jimeng_submit_id: "submit_1", parameters: { model: "seedance2.0fast" } };
 const activeJimengSlowJob = { status: "running", platform: "jimeng_cli", jimeng_submit_id: "submit_2", parameters: { model: "seedance2.0" } };
+const activeJimengImageJob = { status: "running", kind: "image", platform: "jimeng_cli", jimeng_submit_id: "submit_img_1", parameters: { model: "5.0" } };
+const jimengImageRateLimitedJob = { status: "rate_limited", kind: "image", platform: "jimeng_cli", parameters: { model: "5.0" } };
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast" }, [jimengRateLimitedJob, activeJimengJob]), true);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0" }, [jimengRateLimitedJob, activeJimengJob]), false);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast" }, [jimengRateLimitedJob]), false);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", model: "seedance2.0fast_vip" }), false);
 assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "lovart", model: "generate_video_seedance_v2_0_fast" }), false);
+assert.equal(jobBlocksSubmission(jimengRateLimitedJob, { platform: "jimeng_cli", kind: "image", model: "5.0" }, [jimengRateLimitedJob, activeJimengJob]), false);
+assert.equal(jobBlocksSubmission(jimengImageRateLimitedJob, { platform: "jimeng_cli", kind: "video", model: "seedance2.0fast" }, [jimengImageRateLimitedJob, activeJimengJob]), false);
 assert.equal(blockingJobs([jimengRateLimitedJob], { platform: "jimeng_cli", model: "seedance2.0_vip" }).length, 0);
 assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0fast" } }), false);
 assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0" } }), true);
 assert.equal(canStartQueuedJob([activeJimengJob, activeJimengSlowJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0" } }), false);
 assert.equal(canStartQueuedJob([activeJimengJob], { platform: "jimeng_cli", parameters: { model: "seedance2.0fast_vip" } }), true);
+assert.equal(canStartQueuedJob([activeJimengJob], { kind: "image", platform: "jimeng_cli", parameters: { model: "5.0" } }), true);
+assert.equal(canStartQueuedJob([activeJimengImageJob], { kind: "image", platform: "jimeng_cli", parameters: { model: "5.0" } }), true);
+assert.equal(canStartQueuedJob([activeJimengImageJob], { kind: "video", platform: "jimeng_cli", parameters: { model: "seedance2.0fast" } }), true);
 assert.equal(
   canStartQueuedJob(
     Array.from({ length: 8 }, (_, index) => ({ job_id: `lovart_${index}`, status: "running", platform: "lovart", lovart_thread_id: `thread_${index}` })),
@@ -427,12 +495,12 @@ const imagePromptHtmlShots = parseShotlistHtml(`
     <td class="c-image-prompt">
       <div class="image-prompt-head"><b>图片提示词 1</b></div>
       <div class="image-prompt-block">@测试首帧骑手石门
-A lone rider before a broken stone gate, 16:9 first frame.</div>
+A lone rider before a broken stone gate, 21:9 first frame.</div>
     </td>
     <td class="c-prompt">
       <div class="prompt-head"><b>提示词 1</b></div>
       <div class="prompt-block">@测试首帧骑手石门
-从新建首帧开始生成视频。8秒。16:9。</div>
+从新建首帧开始生成视频。8秒。21:9。</div>
     </td>
   </tr>
 `, "lovart");
@@ -440,7 +508,42 @@ assert.equal(imagePromptHtmlShots.length, 1);
 assert.equal(imagePromptHtmlShots[0].shot_id, "分镜3-2-1");
 assert.match(imagePromptHtmlShots[0].image_prompt, /A lone rider before a broken stone gate/);
 assert.match(imagePromptHtmlShots[0].video_prompt, /从新建首帧开始生成视频/);
+assert.equal(imagePromptHtmlShots[0].size, "21:9");
 assert.deepEqual(imagePromptHtmlShots[0].tag_refs, ["@测试首帧骑手石门"]);
+
+const defaultGeneratorParameterSource = `
+function firstAvailableModel() { return "generate_image_nano_banana_pro"; }
+function normalizePlatform(value) { return value === "jimeng_cli" ? "jimeng_cli" : "lovart"; }
+function isKlingModelName(value) { return /kling/i.test(String(value || "")); }
+function isSeedanceModelName(value) { return /seedance/i.test(String(value || "")); }
+${appSource.slice(appSource.indexOf("function defaultImageParameters"), appSource.indexOf("function transitionLabel"))}
+result = {
+  imageSize: defaultImageParameters("21:9").size,
+  jimengFirstFrameVideoSize: defaultVideoParameters({
+    transition: "new_frame",
+    image_prompt: "@测试首帧",
+    platform: "jimeng_cli",
+    video_model: "seedance2.0",
+    duration: "8s",
+    size: "21:9",
+  }).size,
+  lovartFirstFrameVideoSize: defaultVideoParameters({
+    transition: "new_frame",
+    image_prompt: "@测试首帧",
+    platform: "lovart",
+    video_model: "generate_video_seedance_v2_0_fast",
+    duration: "8s",
+    size: "21:9",
+  }).size,
+};
+`;
+const defaultGeneratorParameterContext = { result: null };
+vm.runInNewContext(defaultGeneratorParameterSource, defaultGeneratorParameterContext);
+assert.deepEqual(defaultGeneratorParameterContext.result, {
+  imageSize: "21:9",
+  jimengFirstFrameVideoSize: "21:9",
+  lovartFirstFrameVideoSize: "21:9",
+});
 
 const sectionHtmlShots = parseShotlistHtml(`
   <h2 class="block-title">Episode 1 — Fog Island</h2>

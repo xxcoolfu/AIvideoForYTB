@@ -220,6 +220,7 @@
           <button id="resetView">重置视图</button>
           <span id="bulkSubmitStatus" class="bulk-submit-status"></span>
           <span id="status">准备就绪</span>
+          <span id="statusActions" class="status-actions"></span>
         </div>
         <div id="canvas" class="canvas"></div>
         <div id="contextMenu" class="context-menu" hidden>
@@ -276,6 +277,18 @@
         <video id="videoPreviewPlayer" controls></video>
         <div class="modal-actions">
           <button id="capturePreviewFrame">提取当前帧</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="imagePreviewModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-image-preview></div>
+      <div class="modal-panel image-preview-panel">
+        <div class="modal-header">
+          <strong id="imagePreviewTitle">图片预览</strong>
+        </div>
+        <div class="image-preview-stage">
+          <img id="imagePreviewImg" alt="">
         </div>
       </div>
     </div>

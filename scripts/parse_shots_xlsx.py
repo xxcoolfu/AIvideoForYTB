@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import posixpath
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -48,6 +49,13 @@ def cell_value(cell, shared_strings):
     return raw
 
 
+def workbook_target_path(target):
+    normalized = str(target or "").replace("\\", "/")
+    if normalized.startswith("/"):
+        return posixpath.normpath(normalized.lstrip("/"))
+    return posixpath.normpath(posixpath.join("xl", normalized))
+
+
 def first_sheet_path(zf):
     workbook = ET.fromstring(zf.read("xl/workbook.xml"))
     sheet = workbook.find("main:sheets/main:sheet", NS_MAIN)
@@ -58,9 +66,7 @@ def first_sheet_path(zf):
     for rel in rels.findall("rel:Relationship", NS_REL):
         if rel.attrib.get("Id") == rel_id:
             target = rel.attrib.get("Target", "")
-            if not target.startswith("xl/"):
-                target = f"xl/{target}"
-            return target
+            return workbook_target_path(target)
     raise ValueError("找不到第一张工作表")
 
 

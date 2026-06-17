@@ -52,6 +52,7 @@ const state = {
   autoRefreshingJobId: null,
   syncJobsTimer: null,
   canvasSaveTimer: null,
+  startupSlowTimer: null,
   canvasDirty: false,
   inspectorEditing: false,
   lastInspectorInputAt: 0,
@@ -70,6 +71,9 @@ const state = {
     retryTimer: null,
   },
   availableProjects: [],
+  queueResume: { status: "idle", message: "" },
+  startupLoading: false,
+  startupError: "",
   rightTab: "inspector",
   leftPanelResize: null,
   rightPanelResize: null,
@@ -114,6 +118,8 @@ const LEFT_PANEL_WIDTH_KEY = "ai-video-left-panel-width";
 const RIGHT_PANEL_WIDTH_KEY = "ai-video-right-panel-width";
 const LAST_PROJECT_KEY = "ai-video-last-project-id";
 const CANVAS_DRAFT_PREFIX = "ai-video-canvas-draft:";
+const MAX_CANVAS_DRAFT_CHARS = 5 * 1024 * 1024;
+const STARTUP_SLOW_MS = 5000;
 const CANVAS_MIN_SCALE = 0.1;
 const CANVAS_MAX_SCALE = 2.5;
 const CONTEXT_NODE_GAP = 90;
@@ -146,11 +152,30 @@ function uid(prefix) {
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-  });
-  const data = await res.json();
+  const { timeoutMs, ...fetchOptions } = options;
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = timeoutMs
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  let res;
+  try {
+    res = await fetch(path, {
+      ...fetchOptions,
+      signal: controller?.signal || fetchOptions.signal,
+      headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
+    });
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("服务响应超时，请稍后重试。");
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = { error: "服务返回内容无法读取。" };
+  }
   if (!res.ok) throw new Error(data.error || "请求失败");
   return data;
 }
@@ -161,16 +186,60 @@ function setStatus(message, tone = "") {
   el.className = tone;
 }
 
+function clearStatusActions() {
+  const box = $("#statusActions");
+  if (box) box.innerHTML = "";
+}
+
+function setStatusActions(actions = []) {
+  const box = $("#statusActions");
+  if (!box) return;
+  box.innerHTML = "";
+  for (const action of actions) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action.label;
+    button.addEventListener("click", action.onClick);
+    box.appendChild(button);
+  }
+}
+
+function updateQueueResumeStatus(queueResume = state.queueResume) {
+  if (!queueResume?.status || queueResume.status === "idle") return;
+  const tone = queueResume.status === "failed" ? "bad" : "ok";
+  setStatus(queueResume.message || "任务队列状态已更新。", tone);
+}
+
 function canvasDraftKey(projectId = state.projectId) {
   return `${CANVAS_DRAFT_PREFIX}${projectId}`;
 }
 
-function readCanvasDraft(projectId = state.projectId) {
+function invalidCanvasDraft(reason, projectId = state.projectId, savedAt = "") {
+  return {
+    invalid: true,
+    reason,
+    project_id: projectId,
+    saved_at: savedAt,
+  };
+}
+
+function readCanvasDraft(projectId = state.projectId, options = {}) {
   try {
     const raw = localStorage.getItem(canvasDraftKey(projectId));
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    if (raw.length > MAX_CANVAS_DRAFT_CHARS) {
+      return options.includeInvalid ? invalidCanvasDraft("本地备份太大，已先跳过自动恢复。", projectId) : null;
+    }
+    const draft = JSON.parse(raw);
+    if (draft?.project_id && draft.project_id !== projectId) {
+      return options.includeInvalid ? invalidCanvasDraft("本地备份属于另一个项目，已先跳过自动恢复。", projectId, draft.saved_at) : null;
+    }
+    if (!draft?.canvas || !Array.isArray(draft.canvas.nodes) || !Array.isArray(draft.canvas.edges) || !Array.isArray(draft.canvas.assets)) {
+      return options.includeInvalid ? invalidCanvasDraft("本地备份格式异常，已先跳过自动恢复。", projectId, draft?.saved_at) : null;
+    }
+    return draft;
   } catch {
-    return null;
+    return options.includeInvalid ? invalidCanvasDraft("本地备份读取失败，已先跳过自动恢复。", projectId) : null;
   }
 }
 
@@ -239,7 +308,7 @@ function mergeCanvasDraftWithServer(draftCanvas = {}, serverCanvas = {}) {
   return next;
 }
 
-function renderCanvasDraftNotice(draft = readCanvasDraft()) {
+function renderCanvasDraftNotice(draft = readCanvasDraft(state.projectId, { includeInvalid: true })) {
   const notice = $("#canvasDraftNotice");
   if (!notice) return;
   if (!draft) {
@@ -248,8 +317,11 @@ function renderCanvasDraftNotice(draft = readCanvasDraft()) {
   }
   const text = $("#canvasDraftText");
   if (text) {
-    text.textContent = `有一份未同步的本地画布备份${formatDraftTime(draft.saved_at) ? `（${formatDraftTime(draft.saved_at)}）` : ""}。`;
+    text.textContent = draft.invalid
+      ? `发现异常本地备份：${draft.reason}`
+      : `有一份未同步的本地画布备份${formatDraftTime(draft.saved_at) ? `（${formatDraftTime(draft.saved_at)}）` : ""}。`;
   }
+  $("#restoreCanvasDraft").disabled = Boolean(draft.invalid);
   notice.hidden = false;
 }
 
@@ -748,13 +820,14 @@ async function startBulkSubmitSelected() {
     setStatus("先选中要批量提交的图片/视频生成节点。", "bad");
     return;
   }
-  const tagBlockMessage = tagBindingBlockMessage();
-  if (tagBlockMessage) {
-    showTagBindingBlock(tagBlockMessage);
+  const blockedByTags = generatorsBlockedByMissingTags(nodes);
+  const eligibleNodes = nodes.filter((node) => !blockedByTags.some((item) => item.node.id === node.id));
+  if (blockedByTags.length) showTagBindingBlock(selectedGeneratorsTagBindingBlockMessage(nodes));
+  if (!eligibleNodes.length) {
     renderToolbarState();
     return;
   }
-  const controlBlockMessage = globalControlBlockMessage(nodes);
+  const controlBlockMessage = globalControlBlockMessage(eligibleNodes);
   if (controlBlockMessage) {
     setStatus(controlBlockMessage, "bad");
     renderToolbarState();
@@ -764,7 +837,7 @@ async function startBulkSubmitSelected() {
     ...state.bulkSubmit.queue,
     state.bulkSubmit.currentNodeId,
   ].filter(Boolean));
-  const nextIds = nodes.map((node) => node.id).filter((id) => !existing.has(id));
+  const nextIds = eligibleNodes.map((node) => node.id).filter((id) => !existing.has(id));
   if (!nextIds.length) {
     setStatus("这些节点已经在批量提交队列里了。", "bad");
     return;
@@ -776,7 +849,8 @@ async function startBulkSubmitSelected() {
   state.bulkSubmit.queue.push(...nextIds);
   state.bulkSubmit.total += nextIds.length;
   renderToolbarState();
-  setStatus(`已加入 ${nextIds.length} 个生成节点。${bulkSubmitStateText()}`, "ok");
+  const skippedText = blockedByTags.length ? `，跳过 ${blockedByTags.length} 个缺少标签绑定的节点` : "";
+  setStatus(`已加入 ${nextIds.length} 个生成节点${skippedText}。${bulkSubmitStateText()}`, blockedByTags.length ? "bad" : "ok");
   try {
     await saveCanvas({ silent: true });
   } catch (error) {
@@ -797,6 +871,9 @@ async function refreshBulkSubmitState() {
 }
 
 async function submitBulkNode(nodeId) {
+  const node = state.canvas.nodes.find((item) => item.id === nodeId);
+  const changedMode = ensureJimengImageModeForInputs(node);
+  if (changedMode) await saveCanvas({ silent: true });
   const result = await api("/api/jobs/submit", {
     method: "POST",
     body: JSON.stringify({ project_id: state.projectId, node_id: nodeId, force_duplicate: false }),
@@ -831,6 +908,13 @@ async function processBulkSubmitQueue() {
       if (!node || !isGeneratorNode(node)) {
         bulk.queue.shift();
         bulk.skipped += 1;
+        continue;
+      }
+      const tagBlockMessage = generatorTagBindingBlockMessage(node);
+      if (tagBlockMessage) {
+        bulk.queue.shift();
+        bulk.skipped += 1;
+        setStatus(`已跳过 ${nodeTitle(node)}：${tagBlockMessage}`, "bad");
         continue;
       }
       bulk.currentNodeId = nodeId;
@@ -1381,11 +1465,11 @@ function generatorParameters(data = {}) {
   return merged;
 }
 
-function defaultImageParameters() {
+function defaultImageParameters(size = "16:9") {
   const preferredLovartImageModel = firstAvailableModel("image", "generate_image_nano_banana_pro");
   return {
     model: preferredLovartImageModel,
-    size: "16:9",
+    size: size || "16:9",
     feature: "auto",
   };
 }
@@ -1424,7 +1508,7 @@ function defaultVideoParameters(shot) {
       platform,
       model,
       duration,
-      size: wantsFirstFrame ? "" : (shot.size || "16:9"),
+      size: shot.size || (wantsFirstFrame ? "" : "16:9"),
       mode: recommended.mode || (wantsFirstFrame ? "image2video" : "text2video"),
       video_resolution: "720p",
     };
@@ -1682,11 +1766,51 @@ function projectTagsMissingBindings() {
   return (state.tags || []).filter((tag) => !(tag.bound_asset_ids || []).length);
 }
 
-function tagBindingBlockMessage(missingTags = projectTagsMissingBindings()) {
+function missingBoundTagsForPrompt(prompt) {
+  const refs = new Set(tagRefsForPrompt(prompt));
+  return (state.tags || []).filter((tag) => refs.has(tag.label) && !(tag.bound_asset_ids || []).length);
+}
+
+function generatorNodeTagPrompt(node) {
+  if (!node || !isGeneratorNode(node)) return "";
+  const collected = collectSubmissionInputs(node.id);
+  return [node.data?.prompt, ...collected.promptParts].filter(Boolean).join("\n\n");
+}
+
+function missingBoundTagsForGenerator(node) {
+  return missingBoundTagsForPrompt(generatorNodeTagPrompt(node));
+}
+
+function tagBindingBlockMessage(missingTags = projectTagsMissingBindings(), options = {}) {
   if (!missingTags.length) return "";
   const preview = missingTags.slice(0, 5).map((tag) => tag.label).join("、");
   const suffix = missingTags.length > 5 ? " 等" : "";
-  return `还有 ${missingTags.length} 个项目标签没绑定资产：${preview}${suffix}。先在“项目标签”完成绑定，再提交生成。`;
+  const scope = options.scope === "selected" ? "选中节点引用的标签" : options.scope === "node" ? "当前节点引用的标签" : "项目标签";
+  return `还有 ${missingTags.length} 个${scope}没绑定资产：${preview}${suffix}。先在“项目标签”完成绑定，再提交生成。`;
+}
+
+function generatorTagBindingBlockMessage(node) {
+  return tagBindingBlockMessage(missingBoundTagsForGenerator(node), { scope: "node" });
+}
+
+function generatorsBlockedByMissingTags(nodes = selectedGeneratorNodes()) {
+  return (nodes || [])
+    .map((node) => ({ node, missingTags: missingBoundTagsForGenerator(node) }))
+    .filter((item) => item.missingTags.length);
+}
+
+function selectedGeneratorsTagBindingBlockMessage(nodes = selectedGeneratorNodes()) {
+  const blocked = generatorsBlockedByMissingTags(nodes);
+  if (!blocked.length) return "";
+  const tags = [];
+  for (const item of blocked) {
+    for (const tag of item.missingTags) {
+      if (!tags.some((existing) => existing.label === tag.label)) tags.push(tag);
+    }
+  }
+  const previewNodes = blocked.slice(0, 4).map((item) => nodeTitle(item.node)).join("、");
+  const nodeSuffix = blocked.length > 4 ? " 等" : "";
+  return `${tagBindingBlockMessage(tags, { scope: "selected" })}受影响节点：${previewNodes}${nodeSuffix}。`;
 }
 
 function showTagBindingBlock(message = tagBindingBlockMessage()) {
@@ -1929,6 +2053,30 @@ function buildSubmissionPreview(node) {
     promptBase,
     finalPrompt,
   };
+}
+
+function jimengImageNodeHasImageInputs(node) {
+  if (!node || node.type !== "imageGen" || normalizePlatform(node.data?.platform) !== "jimeng_cli") return false;
+  const collected = collectSubmissionInputs(node.id);
+  return collected.assetIds.some((assetId) => assetById(assetId)?.kind === "image");
+}
+
+function ensureJimengImageModeForInputs(node) {
+  if (!jimengImageNodeHasImageInputs(node)) return false;
+  const normalized = normalizeGeneratorData(node.data || {});
+  const currentMode = normalized.platform_parameters?.jimeng_cli?.mode || "text2image";
+  if (currentMode !== "text2image") return false;
+  patchNodeData(node.id, {
+    platform: "jimeng_cli",
+    platform_parameters: {
+      ...(normalized.platform_parameters || {}),
+      jimeng_cli: {
+        ...(normalized.platform_parameters?.jimeng_cli || {}),
+        mode: "image2image",
+      },
+    },
+  });
+  return true;
 }
 
 function renderReferenceAssetFields(node) {
@@ -2258,6 +2406,7 @@ function updateShotBulkActions() {
   const selectedCount = selectedShotIds().length;
   const toggleButton = $("#toggleAllShots");
   const deleteButton = $("#deleteSelectedShots");
+  const extractPromptDiffButton = $("#extractSelectedShotPromptDiffs");
   const applyButton = $("#applyBulkShotParams");
   const workflowButton = $("#applyDefaultWorkflow");
   const ungeneratedWorkflowButton = $("#applyUngeneratedWorkflow");
@@ -2268,6 +2417,10 @@ function updateShotBulkActions() {
   if (deleteButton) {
     deleteButton.disabled = !selectedCount;
     deleteButton.textContent = selectedCount ? `删除 ${selectedCount} 条` : "删除分镜";
+  }
+  if (extractPromptDiffButton) {
+    extractPromptDiffButton.disabled = !selectedCount;
+    extractPromptDiffButton.textContent = selectedCount ? `提取 ${selectedCount} 条提示词修改` : "提取提示词修改";
   }
   if (applyButton) {
     applyButton.disabled = !selectedCount;
@@ -2388,6 +2541,129 @@ function selectedShotIndexes() {
   return state.shots
     .map((shot, index) => ids.has(String(shot.shot_id || "")) ? index : -1)
     .filter((index) => index >= 0);
+}
+
+function normalizePromptForComparison(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+function selectedShotVideoPromptDiffs(shotIds = selectedShotIds()) {
+  const ids = new Set((shotIds || []).map((shotId) => String(shotId || "")).filter(Boolean));
+  const diffs = [];
+  const missingNodeShotIds = [];
+  for (const shot of state.shots) {
+    const shotId = String(shot.shot_id || "");
+    if (!ids.has(shotId)) continue;
+    const videoNode = state.canvas.nodes.find((node) => (
+      node.type === "videoGen"
+      && String(node.data?.shot_id || "") === shotId
+      && (!node.data?.shot_role || node.data.shot_role === "video")
+    ));
+    if (!videoNode) {
+      missingNodeShotIds.push(shotId);
+      continue;
+    }
+    const shotPrompt = normalizePromptForComparison(shot.video_prompt);
+    const nodePrompt = normalizePromptForComparison(videoNode.data?.prompt);
+    if (shotPrompt === nodePrompt) continue;
+    diffs.push({
+      shot_id: shotId,
+      node_id: videoNode.id,
+      original_video_prompt: String(shot.video_prompt || ""),
+      node_video_prompt: String(videoNode.data?.prompt || ""),
+    });
+  }
+  return { diffs, missingNodeShotIds };
+}
+
+function promptDiffFingerprint(diffs = []) {
+  return JSON.stringify(diffs.map((diff) => ({
+    shot_id: diff.shot_id,
+    node_id: diff.node_id,
+    original_video_prompt: normalizePromptForComparison(diff.original_video_prompt),
+    node_video_prompt: normalizePromptForComparison(diff.node_video_prompt),
+  })));
+}
+
+function memoTextHtml(value) {
+  const text = escapeHtml(String(value || "")).replace(/\n/g, "<br>");
+  return text || "<span>空</span>";
+}
+
+function videoPromptDiffMemoHtml(diffs, createdAt) {
+  return [
+    `<div><strong>分镜视频提示词修改记录</strong></div>`,
+    `<div>提取时间：${escapeHtml(formatTimeLabel(createdAt))}</div>`,
+    ...diffs.map((diff) => [
+      `<div><br><strong>分镜 ${escapeHtml(diff.shot_id)}</strong></div>`,
+      `<div><strong>分镜表视频提示词</strong></div>`,
+      `<div>${memoTextHtml(diff.original_video_prompt)}</div>`,
+      `<div><br><strong>视频生成节点提示词</strong></div>`,
+      `<div>${memoTextHtml(diff.node_video_prompt)}</div>`,
+    ].join("")),
+  ].join("");
+}
+
+function promptDiffMemoPosition(diffs) {
+  const nodes = diffs
+    .map((diff) => state.canvas.nodes.find((node) => node.id === diff.node_id))
+    .filter(Boolean);
+  if (!nodes.length) return null;
+  return {
+    x: Math.max(...nodes.map((node) => node.x)) + NODE_WIDTH + CONTEXT_NODE_GAP,
+    y: Math.min(...nodes.map((node) => node.y)),
+  };
+}
+
+async function extractSelectedShotPromptDiffs() {
+  const ids = selectedShotIds();
+  if (!ids.length) {
+    setStatus("先勾选要对比的分镜。", "bad");
+    return;
+  }
+  const { diffs, missingNodeShotIds } = selectedShotVideoPromptDiffs(ids);
+  if (!diffs.length) {
+    const missingText = missingNodeShotIds.length
+      ? `其中分镜 ${missingNodeShotIds.join("、")} 还没有视频生成节点。`
+      : "";
+    setStatus(`选中分镜没有发现视频提示词修改。${missingText}`, missingNodeShotIds.length ? "bad" : "ok");
+    return;
+  }
+  const fingerprint = promptDiffFingerprint(diffs);
+  const existingMemo = state.canvas.nodes.find((node) => (
+    node.type === "memo"
+    && node.data?.source_type === "shot_video_prompt_diff"
+    && node.data?.prompt_diff_fingerprint === fingerprint
+  ));
+  if (existingMemo) {
+    setSingleNodeSelection(existingMemo.id);
+    render();
+    setStatus("这些提示词修改已经写入项目复盘，已定位到原备忘录。", "ok");
+    return;
+  }
+  const createdAt = new Date().toISOString();
+  const memoNode = addNode("memo", {
+    title: diffs.length === 1 ? `分镜 ${diffs[0].shot_id} 视频提示词修改` : `${diffs.length} 条分镜视频提示词修改`,
+    html: videoPromptDiffMemoHtml(diffs, createdAt),
+    source_type: "shot_video_prompt_diff",
+    shot_ids: diffs.map((diff) => diff.shot_id),
+    prompt_diffs: diffs,
+    prompt_diff_fingerprint: fingerprint,
+    created_at: createdAt,
+  }, promptDiffMemoPosition(diffs), { render: false });
+  diffs.forEach((diff) => upsertEdge(diff.node_id, memoNode.id));
+  state.canvasDirty = true;
+  await saveCanvas({ silent: true });
+  render();
+  const missingText = missingNodeShotIds.length
+    ? `；分镜 ${missingNodeShotIds.join("、")} 因没有视频生成节点已跳过`
+    : "";
+  setStatus(`已把 ${diffs.length} 条视频提示词修改写入项目复盘${missingText}。`, "ok");
 }
 
 function shotHasWorkflowNodes(shot) {
@@ -2650,6 +2926,29 @@ function closeVideoPreview() {
   if (modal) modal.hidden = true;
 }
 
+function openImagePreview(nodeId) {
+  const node = state.canvas.nodes.find((item) => item.id === nodeId);
+  const asset = node?.data?.asset_id ? assetById(node.data.asset_id) : null;
+  if (asset?.kind !== "image" || !asset.url) return setStatus("先选择一个图片节点。", "bad");
+  $("#imagePreviewTitle").textContent = asset.name || "图片预览";
+  const image = $("#imagePreviewImg");
+  image.src = asset.url;
+  image.alt = asset.name || "";
+  $("#imagePreviewModal").hidden = false;
+  image.onload = () => setStatus("图片预览已打开。", "ok");
+  image.onerror = () => setStatus("图片预览加载失败。文件在本地，但页面没能读取这张图片。", "bad");
+}
+
+function closeImagePreview() {
+  const modal = $("#imagePreviewModal");
+  const image = $("#imagePreviewImg");
+  if (image) {
+    image.removeAttribute("src");
+    image.alt = "";
+  }
+  if (modal) modal.hidden = true;
+}
+
 function renderEdges() {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("edge-layer");
@@ -2718,7 +3017,8 @@ function renderNode(node) {
   } else if (node.type === "memo") {
     body = `<div class="memo-preview">${escapeHtml(memoPlainPreview(node))}</div>`;
   } else if (asset?.kind === "image" && asset.url) {
-    body = `<img src="${asset.url}" alt="${escapeHtml(asset.name)}">`;
+    const previewAttr = isNodeSelected(node.id) ? ` data-preview-image-node="${node.id}" title="点击放大预览"` : "";
+    body = `<img src="${asset.url}" alt="${escapeHtml(asset.name)}" data-image-node="${node.id}"${previewAttr}>`;
   } else if (asset?.kind === "video" && asset.url) {
     const videoName = escapeHtml(asset.name || "视频素材");
     body = `
@@ -2775,6 +3075,17 @@ function renderNode(node) {
 
   el.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".handle")) return;
+    const imageTarget = event.target.closest("[data-image-node]");
+    if (imageTarget) {
+      event.stopPropagation();
+      if (!isNodeSelected(imageTarget.dataset.imageNode)) {
+        clearPendingCanvasDelete();
+        setSingleNodeSelection(imageTarget.dataset.imageNode);
+        state.selectedEdgeId = null;
+        render();
+      }
+      return;
+    }
     if (["BUTTON", "INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
     if (event.button !== 0) return;
     if (activeConnectSourceIds().length && !activeConnectSourceIds().includes(node.id)) {
@@ -2810,6 +3121,12 @@ function renderNode(node) {
     button.addEventListener("click", (event) => {
       event.stopPropagation();
       openVideoPreview(event.currentTarget.dataset.previewNode);
+    });
+  });
+  el.querySelectorAll("[data-preview-image-node]").forEach((image) => {
+    image.addEventListener("click", (event) => {
+      event.stopPropagation();
+      openImagePreview(event.currentTarget.dataset.previewImageNode);
     });
   });
   outputHandle.addEventListener("click", (event) => {
@@ -3025,7 +3342,7 @@ function renderToolbarState() {
   const selectedCount = selectedNodeIds().length;
   const selectedGenerators = selectedGeneratorNodes();
   const selectedGeneratorCount = selectedGenerators.length;
-  const tagBlockMessage = tagBindingBlockMessage();
+  const tagBlockMessage = selectedGeneratorCount ? selectedGeneratorsTagBindingBlockMessage(selectedGenerators) : "";
   const controlBlockMessage = selectedGeneratorCount ? globalControlBlockMessage(selectedGenerators) : "";
   const submitBlockMessage = tagBlockMessage || controlBlockMessage;
   ["#alignLeft", "#alignTop"].forEach((selector) => {
@@ -4033,6 +4350,7 @@ function renderShotTable() {
     <div class="shot-bulk-actions">
       <button id="toggleAllShots">${selectedCount === state.shots.length ? "取消全选" : "全选分镜"}</button>
       <button id="deleteSelectedShots" class="danger" ${selectedCount ? "" : "disabled"}>${selectedCount ? `删除 ${selectedCount} 条` : "删除分镜"}</button>
+      <button id="extractSelectedShotPromptDiffs" class="wide-action" ${selectedCount ? "" : "disabled"}>${selectedCount ? `提取 ${selectedCount} 条提示词修改` : "提取提示词修改"}</button>
     </div>
     <div class="shot-bulk-panel">
       <div class="shot-bulk-title">批量调整${selectedCount ? `：已选 ${selectedCount} 条` : ""}</div>
@@ -4138,6 +4456,9 @@ function renderShotTable() {
     updateShotBulkActions();
   });
   $("#deleteSelectedShots")?.addEventListener("click", deleteSelectedShots);
+  $("#extractSelectedShotPromptDiffs")?.addEventListener("click", () => {
+    extractSelectedShotPromptDiffs().catch((error) => setStatus(`提取提示词修改失败：${error.message}`, "bad"));
+  });
   $("#applyBulkShotParams")?.addEventListener("click", () => {
     applyBulkShotParams().catch((error) => setStatus(`批量调整失败：${error.message}`, "bad"));
   });
@@ -5056,7 +5377,7 @@ async function createShotNodes(indexes = state.shots.map((_, index) => index), w
           "image",
           { x: imageColumnX, y },
           imagePrompt,
-          defaultImageParameters(),
+          defaultImageParameters(shot.size),
           `分镜 ${shot.shot_id} 图片`,
           workflow
         )
@@ -5082,6 +5403,9 @@ async function createShotNodes(indexes = state.shots.map((_, index) => index), w
       }
       if (shot.video_model) {
         videoNode.data.common_parameters = { ...(videoNode.data.common_parameters || {}), model: shot.video_model };
+      }
+      if (shot.size) {
+        videoNode.data.common_parameters = { ...(videoNode.data.common_parameters || {}), size: shot.size };
       }
     }
 
@@ -5138,7 +5462,7 @@ function renderInspector() {
   const generatorParams = isGenerator ? renderGeneratorFields(node) : "";
   const referenceAssetFields = isGenerator ? renderReferenceAssetFields(node) : "";
   const submitPreview = isGenerator ? buildSubmissionPreview(node) : null;
-  const tagBlockMessage = isGenerator ? tagBindingBlockMessage() : "";
+  const tagBlockMessage = isGenerator ? generatorTagBindingBlockMessage(node) : "";
   const controlBlockMessage = isGenerator ? globalControlBlockMessage([node]) : "";
   const submitBlockMessage = tagBlockMessage || controlBlockMessage;
   const generatorSummary = isGenerator
@@ -6029,9 +6353,9 @@ function render() {
   renderScriptPanel();
   renderShotTable();
   renderInspector();
-  renderJobs();
-  renderReview();
-  renderParams();
+  if (state.rightTab === "jobs") renderJobs();
+  if (state.rightTab === "review") renderReview();
+  if (state.rightTab === "params") renderParams();
   restorePanelScroll(scrollSnapshot);
   scheduleAutoRefresh();
 }
@@ -6067,6 +6391,7 @@ function sanitizeShotsForState(shots = []) {
 }
 
 async function loadProject(name = state.projectId) {
+  clearStatusActions();
   if (state.autoRefreshTimer) {
     clearTimeout(state.autoRefreshTimer);
     state.autoRefreshTimer = null;
@@ -6081,9 +6406,26 @@ async function loadProject(name = state.projectId) {
   }
   state.autoRefreshingJobId = null;
   state.canvasDirty = false;
+  state.startupLoading = true;
+  state.startupError = "";
+  setStatus(`正在打开项目 ${name}...`);
+  if (state.startupSlowTimer) clearTimeout(state.startupSlowTimer);
+  state.startupSlowTimer = setTimeout(() => {
+    setStatus("项目还在加载。你可以继续等待，或先打开项目列表。", "bad");
+    setStatusActions([
+      { label: "重试", onClick: () => loadProject(name).catch((error) => showStartupError(error, name)) },
+      { label: "打开项目列表", onClick: () => openProjectPicker().catch((error) => setStatus(error.message, "bad")) },
+      { label: "检查服务", onClick: () => checkServiceHealth() },
+    ]);
+  }, STARTUP_SLOW_MS);
   const data = await api(`/api/project?project_id=${encodeURIComponent(name)}`);
+  if (state.startupSlowTimer) {
+    clearTimeout(state.startupSlowTimer);
+    state.startupSlowTimer = null;
+  }
   state.project = data.project;
   state.projectId = data.project.project_id;
+  state.queueResume = data.queue_resume || { status: "idle", message: "" };
   rememberLastProjectId(state.projectId);
   state.canvas = data.canvas;
   state.shots = sanitizeShotsForState(data.shots || []);
@@ -6093,7 +6435,8 @@ async function loadProject(name = state.projectId) {
   state.assetLibrary = data.asset_library || { global_rules: "", templates: [], image_model: "agent-auto" };
   state.promptContext = normalizePromptContextForState(data.prompt_context || {});
   state.script = normalizeScriptForState(data.script || {});
-  const draft = readCanvasDraft(state.projectId);
+  const draftNotice = readCanvasDraft(state.projectId, { includeInvalid: true });
+  const draft = draftNotice?.invalid ? null : draftNotice;
   if (draft?.canvas) {
     state.canvas = mergeCanvasDraftWithServer(draft.canvas, state.canvas);
     state.canvasDirty = true;
@@ -6103,7 +6446,9 @@ async function loadProject(name = state.projectId) {
   state.selectedEdgeId = null;
   $("#projectLabel").textContent = "分镜、素材和任务都保存在这个项目里";
   $("#projectName").value = state.projectId;
+  state.startupLoading = false;
   setStatus(draft?.canvas ? "项目已加载，并恢复了一份未同步的本地备份。" : "项目已加载。", "ok");
+  clearStatusActions();
   render();
   if (draft?.canvas) {
     renderCanvasDraftNotice(draft);
@@ -6111,9 +6456,56 @@ async function loadProject(name = state.projectId) {
       setStatus(`本地备份已恢复，但同步失败：${error.message}`, "bad");
     });
   } else {
-    renderCanvasDraftNotice(null);
+    renderCanvasDraftNotice(draftNotice);
   }
+  updateQueueResumeStatus(state.queueResume);
   requestAnimationFrame(() => requestAnimationFrame(() => fitToNodes({ silent: true })));
+}
+
+function showStartupError(error, projectName = state.projectId) {
+  if (state.startupSlowTimer) {
+    clearTimeout(state.startupSlowTimer);
+    state.startupSlowTimer = null;
+  }
+  state.startupLoading = false;
+  state.startupError = error.message;
+  setStatus(`项目打开失败：${error.message}`, "bad");
+  setStatusActions([
+    { label: "重试", onClick: () => loadProject(projectName).catch((nextError) => showStartupError(nextError, projectName)) },
+    { label: "打开项目列表", onClick: () => openProjectPicker().catch((nextError) => setStatus(nextError.message, "bad")) },
+    { label: "检查服务", onClick: () => checkServiceHealth() },
+  ]);
+  render();
+}
+
+async function checkServiceHealth() {
+  try {
+    const health = await api("/api/health", { timeoutMs: 3000 });
+    setStatus(
+      health.project_root_readable
+        ? "服务正常，项目目录可读取。"
+        : `服务正常，但项目目录不可读取：${health.project_root_error || health.project_root}`,
+      health.project_root_readable ? "ok" : "bad"
+    );
+  } catch (error) {
+    setStatus(`服务暂时没有响应：${error.message}`, "bad");
+  }
+}
+
+async function loadLovartParameters() {
+  if (state.params) {
+    renderParams();
+    return;
+  }
+  renderParams();
+  try {
+    state.params = await api("/api/lovart/parameters", { timeoutMs: 8000 });
+    renderParams();
+    renderInspector();
+  } catch (error) {
+    setStatus(`Lovart 参数稍后再同步：${error.message}`, "bad");
+    renderParams();
+  }
 }
 
 function upsertJob(job) {
@@ -6138,8 +6530,10 @@ async function syncJobsState(silent = false) {
   state.jobs = data.jobs || [];
   state.canvas = data.canvas || state.canvas;
   state.assetLibrary = data.asset_library || state.assetLibrary;
+  state.queueResume = data.queue_resume || state.queueResume;
   render();
   if (!silent) setStatus("任务状态已更新。", "ok");
+  if (silent) updateQueueResumeStatus(state.queueResume);
   if (state.bulkSubmit.active) {
     processBulkSubmitQueue().catch((error) => stopBulkSubmit(error.message));
   }
@@ -6156,6 +6550,7 @@ async function toggleQueuePause() {
   state.jobs = result.jobs || state.jobs;
   state.canvas = result.canvas || state.canvas;
   state.assetLibrary = result.asset_library || state.assetLibrary;
+  state.queueResume = result.queue_resume || state.queueResume;
   render();
   setStatus(
     paused
@@ -6469,7 +6864,8 @@ async function importRemoteAsset() {
 
 async function submitGeneration(nodeId, button = null) {
   const feedback = $("#submitFeedback");
-  const tagBlockMessage = tagBindingBlockMessage();
+  const node = state.canvas.nodes.find((item) => item.id === nodeId);
+  const tagBlockMessage = generatorTagBindingBlockMessage(node);
   if (tagBlockMessage) {
     showTagBindingBlock(tagBlockMessage);
     if (feedback) {
@@ -6479,7 +6875,6 @@ async function submitGeneration(nodeId, button = null) {
     renderToolbarState();
     return;
   }
-  const node = state.canvas.nodes.find((item) => item.id === nodeId);
   const controlBlockMessage = globalControlBlockMessage(node ? [node] : []);
   if (controlBlockMessage) {
     setStatus(controlBlockMessage, "bad");
@@ -6501,8 +6896,9 @@ async function submitGeneration(nodeId, button = null) {
     feedback.className = "inline-feedback";
   }
   try {
+    const changedMode = ensureJimengImageModeForInputs(node);
     await saveCanvas();
-    setStatus("正在提交生成任务...");
+    setStatus(changedMode ? "已自动切到即梦图生图，正在提交生成任务..." : "正在提交生成任务...");
     const result = await api("/api/jobs/submit", {
       method: "POST",
       body: JSON.stringify({ project_id: state.projectId, node_id: nodeId, force_duplicate: forceDuplicate }),
@@ -6615,7 +7011,8 @@ function scheduleAutoRefresh() {
   if (state.autoRefreshingJobId) return;
   const queryableJobs = runningJobsForAutoRefresh();
   const waitingForThreadJobs = runningJobsWaitingForThread();
-  if (waitingForThreadJobs.length && !state.syncJobsTimer) {
+  const queueResumeActive = state.queueResume?.status === "running";
+  if ((waitingForThreadJobs.length || queueResumeActive) && !state.syncJobsTimer) {
     state.syncJobsTimer = setTimeout(() => {
       state.syncJobsTimer = null;
       syncJobsState(true).catch((error) => {
@@ -7028,6 +7425,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     button.addEventListener("click", () => {
       state.rightTab = button.dataset.rightTab;
       render();
+      if (state.rightTab === "params") loadLovartParameters();
     });
   });
   $("#createAssetNodes").addEventListener("click", () => createAssetTemplateNodes());
@@ -7074,6 +7472,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
   document.querySelectorAll("[data-close-preview]").forEach((button) => {
     button.addEventListener("click", closeVideoPreview);
+  });
+  document.querySelectorAll("[data-close-image-preview]").forEach((target) => {
+    target.addEventListener("click", closeImagePreview);
   });
   document.querySelectorAll("[data-close-shot-conflict]").forEach((button) => {
     button.addEventListener("click", closeShotConflict);
@@ -7254,6 +7655,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (event.key === "Escape") {
       hideContextMenu();
       if (!$("#videoPreviewModal")?.hidden) closeVideoPreview();
+      if (!$("#imagePreviewModal")?.hidden) closeImagePreview();
       if (!$("#promptOptimizerModal")?.hidden) closePromptOptimizer();
     }
     const editing = isEditingElement(event.target) || isEditingElement(document.activeElement);
@@ -7291,20 +7693,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   try {
+    setStatus("正在准备画布...");
+    render();
     await loadSettings();
     await loadProject(await initialProjectId());
-    api("/api/lovart/parameters")
-      .then((params) => {
-        state.params = params;
-        renderParams();
-        renderInspector();
-      })
-      .catch((error) => {
-        setStatus(`项目已打开，Lovart 参数稍后再同步：${error.message}`, "bad");
-        renderParams();
-      });
   } catch (error) {
-    setStatus(error.message, "bad");
-    render();
+    showStartupError(error, state.projectId);
   }
 });

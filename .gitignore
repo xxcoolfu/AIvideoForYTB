@@ -3,3 +3,5 @@ projects/
 .DS_Store
 node_modules/
 .server.pid
+__pycache__/
+*.pyc

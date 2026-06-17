@@ -32,6 +32,7 @@ const DIRECT_NETWORK_ENV = {
 };
 const lovartProjectLocks = new Map();
 const activeJobSubmissions = new Set();
+const queueResumeStates = new Map();
 const HOMEBREW_FFMPEG = "/opt/homebrew/bin/ffmpeg";
 const HOMEBREW_FFPROBE = "/opt/homebrew/bin/ffprobe";
 const FFMPEG = process.env.FFMPEG || (fs.existsSync(HOMEBREW_FFMPEG) ? HOMEBREW_FFMPEG : "ffmpeg");
@@ -862,6 +863,44 @@ function extractTags(text) {
   return Array.from(refs);
 }
 
+function escapeRegex(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function aliasMatchRegex(alias) {
+  const escaped = escapeRegex(alias);
+  return new RegExp(`(^|[^@\\p{L}\\p{N}_\\-·])(${escaped})(?=$|[^\\p{L}\\p{N}_\\-·])`, "gu");
+}
+
+function explicitTagAliasRegex(alias) {
+  const escaped = escapeRegex(alias);
+  return new RegExp(`(^|[^@\\p{L}\\p{N}_\\-·])@${escaped}(?=$|[^\\p{L}\\p{N}_\\-·])`, "gu");
+}
+
+function promptContainsTagAlias(text, alias) {
+  const cleanAlias = String(alias || "").replace(/^@/, "").trim();
+  if (!cleanAlias) return false;
+  const source = String(text || "");
+  return explicitTagAliasRegex(cleanAlias).test(source) || aliasMatchRegex(cleanAlias).test(source);
+}
+
+function tagRefsForPrompt(prompt, tags = []) {
+  const refs = new Set(extractTags(prompt));
+  const text = String(prompt || "");
+  for (const tag of tags || []) {
+    const canonical = String(tag.label || "").replace(/^@/, "").trim();
+    const aliases = Array.from(new Set([canonical, ...(tag.aliases || [])].map((item) => String(item || "").replace(/^@/, "").trim()).filter(Boolean)));
+    if (aliases.some((alias) => promptContainsTagAlias(text, alias))) refs.add(tag.label);
+  }
+  const values = Array.from(refs);
+  return values.filter((label) => !values.some((fullLabel) => fullLabel !== label && fullLabel.startsWith(`${label} `)));
+}
+
+function missingBoundTagsForPrompt(prompt, tags = []) {
+  const refs = new Set(tagRefsForPrompt(prompt, tags));
+  return (tags || []).filter((tag) => refs.has(tag.label) && !(tag.bound_asset_ids || []).length);
+}
+
 function extractDurationFromPrompt(text) {
   const source = String(text || "");
   const explicit = source.match(/\[\s*总时长\s*[：:]\s*(\d+)\s*秒\s*\]/);
@@ -1609,6 +1648,49 @@ function jimengFailureReason(parsed = {}, fallback = "即梦平台退回失败�
   return humanizeJimengFailureReason(reason) || fallback;
 }
 
+function isLovartProjectMissingError(reason = "") {
+  return /Project ['"][^'"]+['"] does not exist|project_id.*does not exist|project.*not found|项目.*不存在/i.test(String(reason || ""));
+}
+
+function humanizeLovartFailureReason(reason = "", context = "call") {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  const isUpload = context === "upload";
+  const isProject = context === "project";
+  const prefix = isUpload ? "Lovart 参考素材上传失败" : (isProject ? "Lovart 项目创建失败" : "Lovart 调用失败");
+  if (isLovartProjectMissingError(text)) {
+    return "Lovart 项目不存在：本地记录的 Lovart project_id 在平台上找不到了。系统会清掉旧 ID，重新创建 Lovart 项目后再提交。";
+  }
+  if (/urlopen error.*(?:timed out|Operation timed out)|TimeoutError|Errno\s*60|timed out/i.test(text)) {
+    return `${prefix}：连接 Lovart 上传服务超时，任务还没有提交到平台。请先检查网络或代理是否可用；如果文件较大，先压缩参考图后再重试。`;
+  }
+  if (/Name or service not known|getaddrinfo|nodename nor servname|Temporary failure in name resolution|DNS/i.test(text)) {
+    return `${prefix}：本机没有解析到 Lovart 服务地址，任务还没有提交到平台。请检查网络、DNS 或代理设置后重试。`;
+  }
+  if (/Connection refused|Connection reset|RemoteDisconnected|EOF occurred|Broken pipe/i.test(text)) {
+    const action = isUpload
+      ? "如果反复出现，先减少参考图数量或压缩图片。"
+      : "如果反复出现，先检查本地 Lovart API 密钥、代理或 Lovart skill 连接状态。";
+    return `${prefix}：连接被中断，任务还没有稳定提交到平台。请稍后重试；${action}`;
+  }
+  if (/SSL|CERTIFICATE_VERIFY_FAILED|certificate/i.test(text)) {
+    return `${prefix}：本机 SSL 证书校验失败，Lovart 上传请求没有发出去。请检查系统证书或代理证书后重试。`;
+  }
+  if (/HTTP Error 401|Unauthorized|invalid.*(?:key|token|credential)|permission/i.test(text)) {
+    return `${prefix}：Lovart 密钥或权限校验失败。请重新保存 Lovart Access Key 和 Secret Key 后重试。`;
+  }
+  if (/HTTP Error 413|Request Entity Too Large|file too large|payload too large/i.test(text)) {
+    return `${prefix}：参考素材文件过大，平台拒绝接收。请压缩图片或减少参考素材后重试。`;
+  }
+  if (/HTTP Error 429|Too Many Requests|rate limit/i.test(text)) {
+    return `${prefix}：Lovart 上传接口暂时限流。请等一会儿再重试。`;
+  }
+  if (/HTTP Error 5\d\d|Bad Gateway|Service Unavailable|Gateway Timeout/i.test(text)) {
+    return `${prefix}：Lovart 服务端临时异常，任务还没有稳定提交。请稍后重试。`;
+  }
+  return text.length > 1200 ? `${text.slice(0, 1200)}...` : text;
+}
+
 function isJimengFinalGenerationFailure(reason = "") {
   return /generation failed:\s*final generation failed|final generation failed/i.test(String(reason || ""));
 }
@@ -1809,6 +1891,21 @@ function buildJobInputAssets(data, targetNode, kind, collected) {
   return normalizeJobInputReferenceRoles(items, kind, parameters.feature || "auto");
 }
 
+function autoSwitchJimengImageModeForInputs(generatorData, inputAssets = []) {
+  if (normalizePlatform(generatorData?.platform) !== "jimeng_cli") return false;
+  const currentMode = generatorData?.platform_parameters?.jimeng_cli?.mode || "text2image";
+  if (currentMode !== "text2image") return false;
+  if (!inputAssets.some((item) => item.asset_kind === "image")) return false;
+  generatorData.platform_parameters = {
+    ...(generatorData.platform_parameters || {}),
+    jimeng_cli: {
+      ...(generatorData.platform_parameters?.jimeng_cli || {}),
+      mode: "image2image",
+    },
+  };
+  return true;
+}
+
 function buildReferencePromptText(kind, inputAssets = [], parameters = {}) {
   if (!inputAssets.length) return "";
   const standardTags = Array.from(new Set(inputAssets.flatMap((item) => item.tag_labels || []).filter(Boolean)));
@@ -1978,17 +2075,40 @@ async function ensureLovartProjectUnlocked(projectId, env) {
     return inferred;
   }
 
+  return createLovartProject(projectId, env, data.project?.name || projectId);
+}
+
+async function createLovartProject(projectId, env, projectName = "") {
+  const skillPath = lovartSkillPath();
   const createLog = path.join(projectDir(projectId), "logs", `lovart_project_create_${Date.now()}.log`);
   const created = await runCommand(PYTHON, [skillPath, "create-project"], createLog, env);
-  if (!created.ok) throw new Error(created.error || "Lovart project 创建失败");
+  if (!created.ok) throw new Error(humanizeLovartFailureReason(created.error, "project") || "Lovart project 创建失败");
   const parsed = parseJsonFromOutput(created.stdout);
   if (!parsed.project_id) throw new Error(`Lovart project 创建返回无法解析：${created.stdout}`);
   const lovartProjectId = parsed.project_id;
-
   const renameLog = path.join(projectDir(projectId), "logs", `lovart_project_rename_${Date.now()}.log`);
-  await runCommand(PYTHON, [skillPath, "project-rename", "--project-id", lovartProjectId, "--name", data.project?.name || projectId], renameLog, env);
+  await runCommand(PYTHON, [skillPath, "project-rename", "--project-id", lovartProjectId, "--name", projectName || projectId], renameLog, env);
   saveProjectMeta(projectId, { lovart_project_id: lovartProjectId });
   return lovartProjectId;
+}
+
+function clearMissingLovartProject(projectId, missingProjectId = "") {
+  const data = loadProject(projectId);
+  let projectChanged = false;
+  let jobsChanged = false;
+  if (!missingProjectId || data.project?.lovart_project_id === missingProjectId) {
+    data.project.lovart_project_id = "";
+    data.project.updated_at = now();
+    projectChanged = true;
+  }
+  for (const job of data.jobs || []) {
+    if (!missingProjectId || job.lovart_project_id === missingProjectId) {
+      job.lovart_project_id = "";
+      jobsChanged = true;
+    }
+  }
+  if (projectChanged) writeJson(path.join(projectDir(projectId), "project.json"), data.project);
+  if (jobsChanged) writeJson(path.join(projectDir(projectId), "jobs.json"), data.jobs);
 }
 
 async function ensureLovartProject(projectId, env) {
@@ -2224,7 +2344,7 @@ async function runLovartJob(projectId, job, canvas) {
   try {
     lovartProjectId = await ensureLovartProject(projectId, env);
   } catch (error) {
-    return { ok: false, reason: error.message };
+    return { ok: false, reason: humanizeLovartFailureReason(error.message, "project") || error.message };
   }
 
   for (const input of orderedInputs) {
@@ -2237,7 +2357,7 @@ async function runLovartJob(projectId, job, canvas) {
     if (!asset.file_path) continue;
     const uploadLog = path.join(dir, "logs", `${job.job_id}_upload_${asset.asset_id}.log`);
     const upload = await runCommand(PYTHON, [skillPath, "upload", "--file", asset.file_path], uploadLog, env);
-    if (!upload.ok) return { ok: false, reason: `参考素材上传失败：${upload.error}` };
+    if (!upload.ok) return { ok: false, reason: humanizeLovartFailureReason(upload.error, "upload") || "Lovart 参考素材上传失败。" };
     try {
       const parsed = JSON.parse(upload.stdout);
       if (parsed.url) uploaded.push({ ...input, url: parsed.url });
@@ -2267,7 +2387,7 @@ async function runLovartJob(projectId, job, canvas) {
     referenceText,
     job.kind === "image" ? "任务: 生成图片。" : "任务: 生成视频。",
   ].join("\n\n");
-  const chatArgs = [
+  let chatArgs = [
     skillPath,
     "chat",
     "--project-id",
@@ -2285,10 +2405,29 @@ async function runLovartJob(projectId, job, canvas) {
   ];
   job.submitted_prompt = prompt;
   job.submitted_command = `${PYTHON} ${chatArgs.join(" ")}`;
-  const result = await runCommand(PYTHON, chatArgs, logFile, env);
+  let result = await runCommand(PYTHON, chatArgs, logFile, env);
+
+  if (!result.ok && isLovartProjectMissingError(result.error)) {
+    const staleProjectId = lovartProjectId;
+    clearMissingLovartProject(projectId, staleProjectId);
+    try {
+      lovartProjectId = await createLovartProject(projectId, env, loadProject(projectId).project?.name || projectId);
+    } catch (error) {
+      const createReason = humanizeLovartFailureReason(error.message, "project") || error.message;
+      return {
+        ok: false,
+        reason: `Lovart 项目不存在：本地旧 project_id 已失效，系统已清掉旧 ID；但重新创建 Lovart 项目失败。${createReason}`,
+      };
+    }
+    const staleIndex = chatArgs.indexOf(staleProjectId);
+    if (staleIndex >= 0) chatArgs[staleIndex] = lovartProjectId;
+    job.submitted_command = `${PYTHON} ${chatArgs.join(" ")}`;
+    const retryLogFile = path.join(dir, "logs", `${job.job_id}_lovart_project_retry.log`);
+    result = await runCommand(PYTHON, chatArgs, retryLogFile, env);
+  }
 
   if (!result.ok) {
-    return { ok: false, reason: result.error || "Lovart 调用失败" };
+    return { ok: false, reason: humanizeLovartFailureReason(result.error, "call") || "Lovart 调用失败" };
   }
 
   let parsed;
@@ -2370,11 +2509,15 @@ async function runJimengJob(projectId, job, canvas) {
   const outputDir = path.join(dir, job.kind === "image" ? "images" : "videos");
   ensureDir(outputDir);
   const logFile = path.join(dir, "logs", `${job.job_id}.log`);
-  const mode = String(job.parameters?.mode || (job.kind === "image" ? "text2image" : "text2video")).trim();
+  let mode = String(job.parameters?.mode || (job.kind === "image" ? "text2image" : "text2video")).trim();
   const orderedInputs = jimengOrderedInputs(job, canvas);
   const imageInputs = orderedInputs.filter((item) => item.asset?.kind === "image");
   const videoInputs = orderedInputs.filter((item) => item.asset?.kind === "video");
   const audioInputs = orderedInputs.filter((item) => item.asset?.kind === "audio");
+  if (job.kind === "image" && mode === "text2image" && imageInputs.length) {
+    mode = "image2image";
+    job.parameters = { ...(job.parameters || {}), mode };
+  }
 
   const args = [mode];
   const referencePrompt = job.kind === "video" ? buildJimengReferencePrompt(orderedInputs, mode) : "";
@@ -2850,6 +2993,10 @@ function isJimengRotatableSeedanceModel(model) {
   return normalized === "seedance2.0fast" || normalized === "seedance2.0";
 }
 
+function isJimengImageJob(job = {}) {
+  return normalizePlatform(job.platform || "lovart") === "jimeng_cli" && job.kind === "image";
+}
+
 function alternateJimengSeedanceModel(model) {
   const normalized = jimengConcurrencyModel(model);
   if (normalized === "seedance2.0fast") return "seedance2.0";
@@ -2905,7 +3052,8 @@ function hasSubmittingJobForPlatform(jobs = [], platform = "lovart") {
   });
 }
 
-function canStartJimengQueuedJobWithModel(jobs = [], model = "") {
+function canStartJimengQueuedJobWithModel(jobs = [], model = "", jobKind = "") {
+  if (jobKind === "image") return true;
   if (isJimengVipModel(model)) return true;
   if (!isJimengRotatableSeedanceModel(model)) {
     return activeJobsForPlatform(jobs, "jimeng_cli").length === 0
@@ -2918,6 +3066,7 @@ function canStartJimengQueuedJobWithModel(jobs = [], model = "") {
 
 function chooseJimengQueueModel(jobs = [], job = {}) {
   const current = jimengConcurrencyModel(job.parameters?.model);
+  if (job.kind !== "video") return current;
   if (!isJimengRotatableSeedanceModel(current)) return current;
   if (canStartJimengQueuedJobWithModel(jobs, current)) return current;
   const alternate = alternateJimengSeedanceModel(current);
@@ -2933,7 +3082,7 @@ function canStartQueuedJob(jobs = [], job = {}) {
     if (hasSubmittingJobForPlatform(jobs, "lovart")) return false;
     return activeCount < 9;
   }
-  if (platform === "jimeng_cli") return canStartJimengQueuedJobWithModel(jobs, job.parameters?.model);
+  if (platform === "jimeng_cli") return canStartJimengQueuedJobWithModel(jobs, job.parameters?.model, job.kind);
   if (hasPendingRateLimitForPlatform(jobs, platform) && activeCount > 0) return false;
   return activeCount === 0;
 }
@@ -2945,6 +3094,7 @@ function jobBlocksSubmission(job = {}, incoming = {}, jobs = []) {
   if (jobPlatform !== incomingPlatform) return false;
   if (incomingPlatform === "jimeng_cli" && isJimengVipModel(incoming.model)) return false;
   if (incomingPlatform === "jimeng_cli") {
+    if (incoming.kind === "image" || isJimengImageJob(job)) return false;
     const incomingModel = jimengConcurrencyModel(incoming.model);
     if (isJimengRotatableSeedanceModel(incomingModel)) {
       return activeJimengJobsForModel(jobs, incomingModel).length > 0;
@@ -3436,7 +3586,7 @@ async function resumeQueuedContinuousJobs(projectId) {
       changed = true;
     }
     if (job.status !== "queued" && job.status !== "rate_limited") continue;
-    if (job.platform === "jimeng_cli" && !isJimengVipModel(job.parameters?.model)) {
+    if (job.platform === "jimeng_cli" && job.kind === "video" && !isJimengVipModel(job.parameters?.model)) {
       const nextModel = chooseJimengQueueModel(data.jobs, job);
       if (nextModel && nextModel !== job.parameters?.model) {
         job.parameters = { ...(job.parameters || {}), model: nextModel };
@@ -3626,6 +3776,77 @@ async function getLovartParameters() {
   } catch {
     return result;
   }
+}
+
+function queueResumeSnapshot(projectId) {
+  return queueResumeStates.get(String(projectId || "AI视频项目")) || {
+    status: "idle",
+    message: "任务队列空闲。",
+  };
+}
+
+function startQueueResume(projectId, reason = "background") {
+  const key = String(projectId || "AI视频项目");
+  const current = queueResumeStates.get(key);
+  if (current?.status === "running") return current;
+
+  const startedAt = now();
+  const state = {
+    status: "running",
+    message: "正在恢复任务队列，项目画布可以先使用。",
+    reason,
+    started_at: startedAt,
+    updated_at: startedAt,
+  };
+  queueResumeStates.set(key, state);
+
+  resumeQueuedContinuousJobs(key)
+    .then(() => {
+      const finishedAt = now();
+      queueResumeStates.set(key, {
+        status: "completed",
+        message: "任务队列已恢复。",
+        reason,
+        started_at: startedAt,
+        updated_at: finishedAt,
+        finished_at: finishedAt,
+      });
+    })
+    .catch((error) => {
+      const finishedAt = now();
+      queueResumeStates.set(key, {
+        status: "failed",
+        message: `任务队列恢复失败：${error.message}`,
+        reason,
+        started_at: startedAt,
+        updated_at: finishedAt,
+        finished_at: finishedAt,
+      });
+    });
+
+  return state;
+}
+
+function healthStatus() {
+  const settings = loadSettings();
+  const root = settings.project_root;
+  let projectRootReadable = false;
+  let projectRootError = "";
+  try {
+    projectRootReadable = fs.existsSync(root) && fs.statSync(root).isDirectory();
+    if (projectRootReadable) fs.accessSync(root, fs.constants.R_OK);
+  } catch (error) {
+    projectRootReadable = false;
+    projectRootError = error.message;
+  }
+  return {
+    ok: true,
+    service: "ai-video-canvas",
+    time: now(),
+    project_root: root,
+    project_root_readable: projectRootReadable,
+    project_root_error: projectRootError,
+  };
 }
 
 async function refreshLovartJob(projectId, job, canvas) {
@@ -3914,6 +4135,10 @@ function serveStatic(req, res) {
 async function handleApi(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
+  if (req.method === "GET" && url.pathname === "/api/health") {
+    return send(res, 200, healthStatus());
+  }
+
   if (req.method === "POST" && url.pathname === "/api/project/create") {
     const body = await readBody(req);
     return send(res, 200, createProject(body.name));
@@ -3922,19 +4147,23 @@ async function handleApi(req, res) {
   if (req.method === "GET" && url.pathname === "/api/project") {
     const projectId = url.searchParams.get("project_id") || "AI视频项目";
     createProject(projectId);
-    await resumeQueuedContinuousJobs(projectId);
-    return send(res, 200, loadProject(projectId));
+    const data = loadProject(projectId);
+    const queueResume = startQueueResume(projectId, "project_open");
+    return send(res, 200, { ...data, queue_resume: queueResume });
   }
 
   if (req.method === "GET" && url.pathname === "/api/jobs/state") {
     const projectId = url.searchParams.get("project_id") || "AI视频项目";
-    await resumeQueuedContinuousJobs(projectId);
+    if (queueResumeSnapshot(projectId).status === "idle") {
+      startQueueResume(projectId, "jobs_state");
+    }
     const data = loadProject(projectId);
     return send(res, 200, {
       project: data.project,
       jobs: data.jobs,
       canvas: data.canvas,
       asset_library: data.asset_library,
+      queue_resume: queueResumeSnapshot(projectId),
     });
   }
 
@@ -3942,7 +4171,7 @@ async function handleApi(req, res) {
     const body = await readBody(req);
     const projectId = body.project_id || "AI视频项目";
     const project = setQueuePaused(projectId, body.paused);
-    await resumeQueuedContinuousJobs(projectId);
+    const queueResume = startQueueResume(projectId, "queue_pause");
     const data = loadProject(projectId);
     return send(res, 200, {
       ok: true,
@@ -3950,6 +4179,7 @@ async function handleApi(req, res) {
       jobs: data.jobs,
       canvas: data.canvas,
       asset_library: data.asset_library,
+      queue_resume: queueResume,
     });
   }
 
@@ -4470,7 +4700,7 @@ async function handleApi(req, res) {
     const parameters = generatorParameters(generatorData);
     data.jobs = pruneDormantJobsForTarget(data.jobs, targetNode.id);
     if (!body.force_duplicate) {
-      const duplicates = activeDuplicateJobs(data.jobs, targetNode.id, { platform, model: parameters.model });
+      const duplicates = activeDuplicateJobs(data.jobs, targetNode.id, { platform, kind, model: parameters.model });
       if (duplicates.length) {
         return send(res, 200, {
           ok: false,
@@ -4506,8 +4736,29 @@ async function handleApi(req, res) {
     if (!hasGlobalControl) {
       return send(res, 400, { ok: false, error: "请先连接至少 1 个全局控制节点，再提交生成任务。" });
     }
+    const inputAssets = buildJobInputAssets(data, targetNode, kind, collected);
+    const autoSwitchedJimengImageMode = kind === "image" && autoSwitchJimengImageModeForInputs(generatorData, inputAssets);
+    if (autoSwitchedJimengImageMode) {
+      targetNode.data = {
+        ...(targetNode.data || {}),
+        platform: generatorData.platform,
+        common_parameters: generatorData.common_parameters || {},
+        platform_parameters: generatorData.platform_parameters || {},
+      };
+      parameters.mode = "image2image";
+    }
     const prompt = [targetNode.data?.prompt, ...collected.promptParts].filter(Boolean).join("\n\n").trim();
     if (!prompt) return send(res, 400, { ok: false, error: "请先连接文本节点，或在生成节点里填写提示词。" });
+    const missingTags = missingBoundTagsForPrompt(prompt, data.tags || []);
+    if (missingTags.length) {
+      const preview = missingTags.slice(0, 5).map((tag) => tag.label).join("、");
+      const suffix = missingTags.length > 5 ? " 等" : "";
+      return send(res, 400, {
+        ok: false,
+        error: `这个节点引用的标签还没绑定资产：${preview}${suffix}。先在“项目标签”完成绑定，再提交生成。`,
+        missing_tags: missingTags.map((tag) => ({ tag_id: tag.tag_id, label: tag.label })),
+      });
+    }
 
     const job = {
       job_id: id("job"),
@@ -4517,7 +4768,7 @@ async function handleApi(req, res) {
       shot_ids: targetNode.data?.shot_ids || [],
       prompt,
       input_asset_ids: collected.assetIds,
-      input_assets: buildJobInputAssets(data, targetNode, kind, collected),
+      input_assets: inputAssets,
       common_parameters: generatorData.common_parameters || {},
       platform_parameters: generatorData.platform_parameters || {},
       parameters: generatorParameters(generatorData),
@@ -4540,6 +4791,7 @@ async function handleApi(req, res) {
     }
     updateAssetLibraryAfterJob(body.project_id, job, { status: job.status, failure_reason: job.failure_reason || "" });
     data.jobs.push(job);
+    if (autoSwitchedJimengImageMode) saveProjectPart(body.project_id, "canvas.json", data.canvas);
     saveProjectPart(body.project_id, "jobs.json", data.jobs);
     void resumeQueuedContinuousJobs(body.project_id).catch(() => {});
     return send(res, 200, { ok: true, job });
@@ -4823,6 +5075,7 @@ if (require.main === module) {
 module.exports = {
   assetsFromLovartResult,
   assetTemplateOutputName,
+  autoSwitchJimengImageModeForInputs,
   blockingJobs,
   buildReferencePromptText,
   buildJimengReferencePrompt,
@@ -4840,12 +5093,14 @@ module.exports = {
   exportProjectReusePackage,
   importProjectReusePackage,
   canAutoRetryJimengJob,
+  humanizeLovartFailureReason,
   isJimengFinalGenerationFailure,
   isJimengVipModel,
   jimengQueryTimeoutPendingReason,
   jobBlocksSubmission,
   loadProject,
   mergeCanvasForSave,
+  missingBoundTagsForPrompt,
   normalizeDeepSeekBaseUrl,
   normalizePromptOptimization,
   placeResultNodes,

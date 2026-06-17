@@ -683,6 +683,17 @@ textarea {
   white-space: nowrap;
 }
 
+.status-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.status-actions button {
+  padding: 4px 7px;
+  font-size: 12px;
+}
+
 #status {
   color: var(--muted);
   overflow: hidden;
@@ -799,6 +810,10 @@ textarea {
   object-fit: contain;
   background: #f3f4f6;
   border-radius: 6px;
+}
+
+.node-body img[data-preview-image-node] {
+  cursor: zoom-in;
 }
 
 .node-video-card {
@@ -956,6 +971,10 @@ textarea {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.shot-bulk-actions .wide-action {
+  grid-column: 1 / -1;
 }
 
 .shot-bulk-panel {
@@ -1847,6 +1866,28 @@ body.right-collapsed .right-tab {
   min-height: 0;
   overflow: auto;
   padding-right: 4px;
+}
+
+.image-preview-panel {
+  width: min(96vw, 1280px);
+  max-height: 94vh;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.image-preview-stage {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  border-radius: 8px;
+  background: #111827;
+}
+
+.image-preview-stage img {
+  max-width: 100%;
+  max-height: 82vh;
+  object-fit: contain;
 }
 
 .shot-conflict-panel .modal-actions {
